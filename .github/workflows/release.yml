@@ -89,7 +89,8 @@ jobs:
           $binary = "build/release/Tenbyte-Mail-Migrator-$env:GITHUB_REF_NAME-windows-amd64.exe"
           Copy-Item "build/bin/Tenbyte Mail Migrator.exe" $binary
           $hash = (Get-FileHash -Algorithm SHA256 $binary).Hash.ToLowerInvariant()
-          "$hash  $([IO.Path]::GetFileName($binary))" | Set-Content -Encoding utf8 "$binary.sha256"
+          $checksum = "$hash  $([IO.Path]::GetFileName($binary))`n"
+          [IO.File]::WriteAllText("$binary.sha256", $checksum, [Text.UTF8Encoding]::new($false))
       - uses: actions/upload-artifact@v7
         with:
           name: tenbyte-mail-migrator-${{ matrix.artifact }}
