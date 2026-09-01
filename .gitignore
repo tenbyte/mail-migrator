@@ -1,0 +1,48 @@
+# OS and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Go test and profiling output
+/coverage.out
+/coverage/
+*.test
+*.prof
+
+# Wails build, packaging, and compliance output
+/build/bin/
+/build/compliance/
+/build/release/
+*.app/
+*.dmg
+*.exe
+*.msi
+*.pkg
+
+# Frontend dependencies and generated files
+/frontend/node_modules/
+/frontend/dist/
+/frontend/wailsjs/
+/frontend/coverage/
+/frontend/.vite/
+/frontend/package.json.md5
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Local application state
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+*.db.v*.bak

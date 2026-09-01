@@ -1,0 +1,19 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "Tenbyte Mail Migrator",
+  "outputfilename": "Tenbyte Mail Migrator",
+  "frontend:install": "npm ci",
+  "frontend:build": "npm run build",
+  "frontend:dev:watcher": "npm run dev",
+  "frontend:dev:serverUrl": "auto",
+  "author": {
+    "name": "Tenbyte"
+  },
+  "info": {
+    "companyName": "Tenbyte",
+    "productName": "Tenbyte Mail Migrator",
+    "productVersion": "0.3.0",
+    "copyright": "Copyright 2026 Tenbyte",
+    "comments": "Desktop application for mailbox migrations"
+  }
+}

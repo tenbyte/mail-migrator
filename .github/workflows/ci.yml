@@ -1,0 +1,106 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install and build frontend
+        run: npm ci && npm run build
+        working-directory: frontend
+      - name: Test Go packages
+        run: go test . ./internal/...
+      - name: Race test Go packages
+        run: go test -race . ./internal/...
+      - name: Vet Go packages
+        run: go vet . ./internal/...
+      - name: Test frontend
+        run: npm test
+        working-directory: frontend
+      - name: Lint frontend
+        run: npm run lint
+        working-directory: frontend
+      - name: Audit npm dependencies
+        run: npm audit
+        working-directory: frontend
+      - name: Scan Go packages for vulnerabilities
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 . ./internal/...
+
+  sbom:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: make sbom
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cyclonedx-sbom
+          path: build/compliance/*.json
+          if-no-files-found: error
+
+  desktop-build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            platform: darwin/universal
+            artifact: macos
+          - os: windows-latest
+            platform: windows/amd64
+            artifact: windows
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci && npm run build
+        working-directory: frontend
+      - name: Build desktop application
+        env:
+          MACOSX_DEPLOYMENT_TARGET: ${{ startsWith(matrix.platform, 'darwin/') && '13.0' || '' }}
+          CGO_CFLAGS: ${{ startsWith(matrix.platform, 'darwin/') && '-mmacosx-version-min=13.0' || '' }}
+          CGO_LDFLAGS: ${{ startsWith(matrix.platform, 'darwin/') && '-mmacosx-version-min=13.0' || '' }}
+        run: go run github.com/wailsapp/wails/v2/cmd/wails@v2.15.0 build -platform ${{ matrix.platform }} -clean
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tenbyte-mail-migrator-${{ matrix.artifact }}
+          path: build/bin/*
+          if-no-files-found: error

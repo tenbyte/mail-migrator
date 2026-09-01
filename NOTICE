@@ -1,0 +1,29 @@
+Tenbyte Mail Migrator
+Copyright 2026 Tenbyte Technologies GmbH
+
+The application source code and documentation are licensed under the Apache
+License 2.0, except for the artwork described below.
+
+Courier artwork
+----------------
+
+The courier artwork in these files is an AI-assisted adaptation inspired by
+the Go Gopher:
+
+  branding/logo.png
+  branding/readme-banner.webp
+  build/appicon.png
+  build/windows/icon.ico
+
+The original Go Gopher was created by Renee French.
+
+Source: https://go.dev/blog/gopher
+License: Creative Commons Attribution 4.0 International
+License URL: https://creativecommons.org/licenses/by/4.0/
+
+The adaptation changes the pose, colors, clothing, accessories, and setting to
+depict a mail courier. It is distributed under CC BY 4.0.
+
+This project is unofficial and is not affiliated with, sponsored by, or
+endorsed by the Go project or Google. The Go Logo is not included in the
+project. Go is a trademark of Google LLC.

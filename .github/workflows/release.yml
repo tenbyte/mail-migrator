@@ -1,0 +1,116 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Verify release version
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          test "$(node -p "require('./frontend/package.json').version")" = "$version"
+          test "$(node -p "require('./wails.json').info.productVersion")" = "$version"
+          grep -Fq "const appVersion = \"$version\"" main.go
+      - name: Install and build frontend
+        run: npm ci && npm run build
+        working-directory: frontend
+      - name: Test and lint release source
+        run: |
+          go test . ./internal/...
+          go vet . ./internal/...
+          npm --prefix frontend test
+          npm --prefix frontend run lint
+
+  build:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            platform: darwin/universal
+            artifact: macos-universal
+          - os: windows-latest
+            platform: windows/amd64
+            artifact: windows-amd64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install and build frontend
+        run: npm ci && npm run build
+        working-directory: frontend
+      - name: Build desktop application
+        env:
+          MACOSX_DEPLOYMENT_TARGET: ${{ startsWith(matrix.platform, 'darwin/') && '13.0' || '' }}
+          CGO_CFLAGS: ${{ startsWith(matrix.platform, 'darwin/') && '-mmacosx-version-min=13.0' || '' }}
+          CGO_LDFLAGS: ${{ startsWith(matrix.platform, 'darwin/') && '-mmacosx-version-min=13.0' || '' }}
+        run: go run github.com/wailsapp/wails/v2/cmd/wails@v2.15.0 build -platform ${{ matrix.platform }} -clean
+      - name: Package macOS application
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          mkdir -p build/release
+          archive="Tenbyte-Mail-Migrator-${GITHUB_REF_NAME}-macos-universal.zip"
+          ditto -c -k --sequesterRsrc --keepParent "build/bin/Tenbyte Mail Migrator.app" "build/release/$archive"
+          cd build/release
+          shasum -a 256 "$archive" > "$archive.sha256"
+      - name: Package Windows application
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path build/release | Out-Null
+          $binary = "build/release/Tenbyte-Mail-Migrator-$env:GITHUB_REF_NAME-windows-amd64.exe"
+          Copy-Item "build/bin/Tenbyte Mail Migrator.exe" $binary
+          $hash = (Get-FileHash -Algorithm SHA256 $binary).Hash.ToLowerInvariant()
+          "$hash  $([IO.Path]::GetFileName($binary))" | Set-Content -Encoding utf8 "$binary.sha256"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tenbyte-mail-migrator-${{ matrix.artifact }}
+          path: build/release/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: tenbyte-mail-migrator-*
+          path: release
+          merge-multiple: true
+      - name: Include license and attribution notices
+        run: cp LICENSE NOTICE release/
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" release/* --verify-tag --generate-notes --title "Tenbyte Mail Migrator $GITHUB_REF_NAME"
