@@ -31,7 +31,11 @@ make build-windows
 
 CI runs on pushes to `main`, pull requests, and manual dispatch. It covers Go tests, race tests, vet, frontend tests, ESLint, the production frontend build, npm audit, govulncheck, CycloneDX SBOM generation, and macOS and Windows desktop builds.
 
-Dependabot checks Go modules, frontend npm packages, and GitHub Actions weekly.
+## Dependency alerts
+
+The repository intentionally uses Dependabot in alert-only mode. The dependency graph and Dependabot alerts remain enabled under GitHub's Security and quality settings, while Dependabot security updates are disabled. There is no `.github/dependabot.yml`, because version-update configuration would allow Dependabot to open pull requests.
+
+Dependency changes are made manually. CI still runs `npm audit` and `govulncheck`, and GitHub lists vulnerable dependencies under Security and quality without creating branches, commits, or pull requests.
 
 ## Release procedure
 
