@@ -113,4 +113,12 @@ jobs:
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" release/* --verify-tag --generate-notes --title "Tenbyte Mail Migrator $GITHUB_REF_NAME"
+          RELEASE_DISCLAIMER: |
+            ## Use at your own risk
+
+            Tenbyte Mail Migrator can make meaningful changes to data in connected accounts. You are responsible for the accounts, permissions, settings, backups, and actions you choose. Keep an independent backup and test with non-critical data before starting a full migration.
+
+            IMAP migration is supported. CalDAV and CardDAV are experimental Alpha features and may not work reliably yet. The software is provided without warranties. See the included `LICENSE` and `NOTICE` files for details.
+
+            These builds are not currently signed or notarized. Windows SmartScreen or macOS Gatekeeper may display a warning when you open them.
+        run: gh release create "$GITHUB_REF_NAME" release/* --verify-tag --generate-notes --notes "$RELEASE_DISCLAIMER" --title "Tenbyte Mail Migrator $GITHUB_REF_NAME"
