@@ -20,8 +20,15 @@ The Go application separates protocol handling from migration state:
 3. The selected data is read from the source and written to the destination.
 4. Mail is streamed rather than staged as mailbox files. Full verification compares source and destination SHA-256 hashes.
 5. Progress and recovery state are committed locally. Reports are derived from that stored state.
+6. After completion, an administrator may explicitly finalize the immutable mailbox-notice snapshot. The destination is attempted before the source, and each enabled side is tracked independently.
 
-Source accounts are read-only during normal migration. A manual delta sync inventories both sides and presents source deletions as explicit destination actions. Unsupported safe deletion operations stop without a broad fallback.
+Source accounts are read-only during migration and delta sync. A manual delta sync inventories both sides and presents source deletions as explicit destination actions. Unsupported safe deletion operations stop without a broad fallback. The only source write is an explicitly confirmed mailbox-notice cutover, which appends one unread message to the source `INBOX`.
+
+## Mailbox notices
+
+Global mailbox-notice settings live in the local settings table. Creating a mail migration snapshots both source and destination templates into one schema-v5 row per side and assigns a random persistent Message-ID to each enabled notice. Editing the global settings later does not affect an existing migration.
+
+Finalization accepts only `COMPLETED` and explicitly confirmed `COMPLETED_WITH_ERRORS` migrations. Before APPEND, the IMAP client searches `INBOX` for the persisted Message-ID. This makes retries and restart recovery idempotent even if a connection failed after the server accepted the message. The source Message-ID is also excluded from later delta-sync transfer and accounting.
 
 ## DAV Alpha gate
 
@@ -37,4 +44,4 @@ The frontend asks the Go binding for update information once during startup. The
 
 Reset operations are owned by the Go process rather than the webview. The backend refuses a reset while a mail or DAV transfer is active, closes SQLite before removing state files, creates a fresh database with the current schema, and then replaces the migration services with instances bound to that database.
 
-A migration-data reset keeps operating-system credentials. A factory reset additionally removes every credential registered under the application's keyring service and reloads the Wails application. If file removal fails, the backend attempts to reopen a usable database and returns a detailed error instead of leaving the reset silent.
+A migration-data reset keeps operating-system credentials and restores the global mailbox-notice settings after creating the fresh database. A factory reset removes those settings and every credential registered under the application's keyring service, then reloads the Wails application. If file removal fails, the backend attempts to reopen a usable database and returns a detailed error instead of leaving the reset silent.

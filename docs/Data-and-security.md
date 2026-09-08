@@ -16,7 +16,7 @@ Migration state is stored in `migrations.db` with owner-only permissions where s
 - Windows: `%LOCALAPPDATA%\Tenbyte\Mail Migrator\migrations.db`
 - Other development platforms: the system configuration directory under `Tenbyte/Mail Migrator/migrations.db`
 
-The database contains server names, account usernames, folder and collection mappings, message metadata, hashes, progress, warnings, conflicts, and report data. It does not store account passwords. Historical messages already stored by an older version are not translated or rewritten.
+The database contains server names, account usernames, folder and collection mappings, message metadata, hashes, progress, warnings, conflicts, report data, mailbox-notice custom text, persistent notice Message-IDs, and delivery status. It does not store account passwords. Historical messages already stored by an older version are not translated or rewritten.
 
 Before a schema upgrade, the application creates a one-time backup beside the database using the form `migrations.db.vN.bak`. WAL and shared-memory files may exist while the application is running.
 
@@ -30,12 +30,20 @@ Closing the application clears session-only destination credentials and DAV Alph
 
 Advanced settings provides two explicit, confirmed reset operations:
 
-- **Reset migration data** removes migration history, progress, mappings, delta-sync state, conflicts, warnings, and recovery records. Saved passwords and the current connection form remain available.
-- **Reset entire app** removes the same migration data and every password stored by this application in the operating system credential store. The application reloads into its first-run state after a successful reset.
+- **Reset migration data** removes migration history, progress, mappings, delta-sync state, conflicts, warnings, and recovery records. Saved passwords, the current connection form, and global mailbox-notice settings remain available.
+- **Reset entire app** removes the same migration data, global mailbox-notice settings, and every password stored by this application in the operating system credential store. The application reloads into its first-run state after a successful reset.
 
 Both operations close SQLite before removing `migrations.db`, its `-wal` and `-shm` sidecars, and schema backups matching `migrations.db.vN.bak`. A fresh database with the current schema is created immediately. Resets are rejected while a transfer is active.
 
 A reset never connects to source or destination servers and therefore cannot remove or modify remote mail, calendars, or contacts. Reports and support bundles previously exported to user-selected locations are outside the application data directory and are not deleted.
+
+## Mailbox-notice cutover
+
+Mailbox notices are opt-in and are never sent automatically. Saving a template only changes local settings. A separate administrator action after completion appends enabled notices to `INBOX`; `COMPLETED_WITH_ERRORS` requires an additional risk confirmation. Normal migration and delta sync keep the source read-only. The expressly confirmed source notice is the only source-mailbox write performed by the application.
+
+Custom text is limited to 10,000 Unicode characters and treated as plaintext. HTML special characters are escaped and line breaks are converted safely. Each message is a `multipart/alternative` email with plaintext and self-contained responsive HTML, inline CSS, no external images, and no tracking. The message is appended without `\\Seen`, so it remains unread. A recipient header is included only when the IMAP username itself is a valid email address.
+
+Each enabled side receives a random Message-ID stored with its migration snapshot. The application searches for it before every APPEND and after uncertain outcomes. Delivery status, UID, UIDVALIDITY, errors, and delivery time are recorded independently for source and destination. A retry processes only undelivered sides. Later delta syncs explicitly exclude the generated source notice from transfer and migration totals.
 
 If a file cannot be removed, the application attempts to reopen a usable database and reports the failed step. If credential deletion fails after the migration database has already been reset, the error explicitly describes that partial result; running the full reset again retries removal of all credentials by application service name, even without the old database.
 
@@ -51,7 +59,7 @@ The GitHub request has a five-second timeout, uses no token, and includes only a
 
 ## Reports and support bundles
 
-Exports are written only after the user selects a destination. Reports and support bundles can contain server names, account identifiers, folder or collection names, message metadata, errors, and migration timing. They do not contain passwords or raw message bodies. Review exports before sharing them.
+Exports are written only after the user selects a destination. Reports and support bundles can contain server names, account identifiers, folder or collection names, message metadata, mailbox-notice custom text, errors, and migration timing. They do not contain passwords or raw migrated message bodies. Review exports before sharing them.
 
 ## Recovery
 

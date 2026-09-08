@@ -1,7 +1,7 @@
 {
   "name": "tenbyte-mail-migrator-frontend",
   "private": true,
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Frontend for Tenbyte Mail Migrator",
   "license": "Apache-2.0",
   "repository": "https://github.com/tenbyte/mail-migrator",
@@ -23,13 +23,13 @@
   "devDependencies": {
     "@eslint/js": "10.0.1",
     "@types/react": "19.2.18",
-    "@types/react-dom": "19.2.5",
+    "@types/react-dom": "19.2.7",
     "@typescript-eslint/eslint-plugin": "8.69.0",
     "@typescript-eslint/parser": "8.69.0",
     "@vitejs/plugin-react": "6.1.1",
-    "eslint": "10.9.1",
+    "eslint": "10.10.0",
     "typescript": "6.0.3",
     "vite": "8.2.2",
-    "vitest": "4.1.11"
+    "vitest": "5.0.0"
   }
 }

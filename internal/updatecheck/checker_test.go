@@ -17,6 +17,7 @@ func TestCheckerComparesReleaseVersions(t *testing.T) {
 		latest    string
 		available bool
 	}{
+		{name: "v0.4 release from v0.3", current: "0.3.0", latest: "v0.4.0", available: true},
 		{name: "newer", current: "0.3.0", latest: "v0.3.1", available: true},
 		{name: "equal", current: "v0.3.0", latest: "0.3.0", available: false},
 		{name: "older", current: "0.3.0", latest: "v0.2.9", available: false},

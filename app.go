@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 
@@ -199,7 +200,7 @@ func (a *App) clearTransientMigrationState() {
 	a.progressMu.Unlock()
 }
 
-func (a *App) resetMigrationData() error {
+func (a *App) resetMigrationData(preserveSettings bool) error {
 	a.lifecycleMu.Lock()
 	defer a.lifecycleMu.Unlock()
 	if a.resetIsBlocked() {
@@ -213,6 +214,14 @@ func (a *App) resetMigrationData() error {
 			return fmt.Errorf("locate local migration data: %w", err)
 		}
 		a.databasePath = path
+	}
+	var noticeSettings domain.MailboxNoticeSettings
+	if preserveSettings && a.db != nil {
+		var err error
+		noticeSettings, err = a.db.MailboxNoticeSettings(context.Background())
+		if err != nil {
+			return fmt.Errorf("read mailbox notice settings before reset: %w", err)
+		}
 	}
 	if a.db != nil {
 		if err := a.db.Close(); err != nil {
@@ -238,18 +247,23 @@ func (a *App) resetMigrationData() error {
 		a.startupErr = err
 		return fmt.Errorf("create a fresh migration database: %w", err)
 	}
+	if preserveSettings {
+		if err := a.db.SaveMailboxNoticeSettings(context.Background(), noticeSettings); err != nil {
+			return fmt.Errorf("restore mailbox notice settings: %w", err)
+		}
+	}
 	a.clearTransientMigrationState()
 	return nil
 }
 
 // ResetMigrationData removes only local migration and recovery state. Saved
 // credentials and exported files are deliberately left untouched.
-func (a *App) ResetMigrationData() error { return a.resetMigrationData() }
+func (a *App) ResetMigrationData() error { return a.resetMigrationData(true) }
 
 // FactoryReset removes local migration state and every credential stored for
 // this application, then reloads the Wails application on success.
 func (a *App) FactoryReset() error {
-	if err := a.resetMigrationData(); err != nil {
+	if err := a.resetMigrationData(false); err != nil {
 		return err
 	}
 	if err := a.credentials.DeleteAll(); err != nil {
@@ -262,6 +276,37 @@ func (a *App) FactoryReset() error {
 }
 
 func (a *App) Defaults() domain.TransferOptions { return domain.DefaultTransferOptions() }
+
+func (a *App) MailboxNoticeSettings() (domain.MailboxNoticeSettings, error) {
+	if err := a.ensureReady(); err != nil {
+		return domain.MailboxNoticeSettings{}, err
+	}
+	return a.db.MailboxNoticeSettings(a.ctx)
+}
+
+func (a *App) SaveMailboxNoticeSettings(settings domain.MailboxNoticeSettings) error {
+	if err := a.ensureReady(); err != nil {
+		return err
+	}
+	if err := validateMailboxNoticeSettings(&settings); err != nil {
+		return err
+	}
+	return a.db.SaveMailboxNoticeSettings(a.ctx, settings)
+}
+
+func normalizeNoticeText(value string) string {
+	value = strings.ReplaceAll(value, "\r\n", "\n")
+	return strings.ReplaceAll(value, "\r", "\n")
+}
+
+func validateMailboxNoticeSettings(settings *domain.MailboxNoticeSettings) error {
+	settings.Source.CustomText = normalizeNoticeText(settings.Source.CustomText)
+	settings.Destination.CustomText = normalizeNoticeText(settings.Destination.CustomText)
+	if utf8.RuneCountInString(settings.Source.CustomText) > 10000 || utf8.RuneCountInString(settings.Destination.CustomText) > 10000 {
+		return errors.New("mailbox notice custom text cannot exceed 10,000 characters")
+	}
+	return nil
+}
 
 func (a *App) CheckForUpdate() domain.UpdateInfo {
 	a.updateOnce.Do(func() {
@@ -393,6 +438,12 @@ func (a *App) StartJob(request domain.StartJobRequest) (int64, error) {
 	}
 	if !request.MailEnabled && !request.Calendar.Enabled && !request.Contacts.Enabled {
 		return 0, errors.New("select at least one service")
+	}
+	if err := validateMailboxNoticeSettings(&request.MailboxNotices); err != nil {
+		return 0, err
+	}
+	if !request.MailEnabled {
+		request.MailboxNotices = domain.MailboxNoticeSettings{}
 	}
 	if request.Options.Concurrency <= 0 {
 		request.Options = domain.DefaultTransferOptions()
@@ -545,6 +596,7 @@ func (a *App) ResumeJob(input domain.ResumeJobRequest) (int64, error) {
 			if preflightErr != nil {
 				return 0, fmt.Errorf("check mailboxes before the delta sync: %w", preflightErr)
 			}
+			a.excludeDeliveredSourceNotice(input.MigrationID, &preflight)
 			currentSource := make(map[string]domain.Mailbox, len(preflight.Source.Mailboxes))
 			for _, mailbox := range preflight.Source.Mailboxes {
 				currentSource[mailbox.Name] = mailbox
@@ -669,6 +721,7 @@ func (a *App) resumeMigration(input domain.ResumeRequest) (int64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("check mailboxes before reconciliation: %w", err)
 	}
+	a.excludeDeliveredSourceNotice(input.MigrationID, &preflight)
 	currentSource := make(map[string]domain.Mailbox, len(preflight.Source.Mailboxes))
 	for _, mailbox := range preflight.Source.Mailboxes {
 		currentSource[mailbox.Name] = mailbox
@@ -694,6 +747,34 @@ func (a *App) resumeMigration(input domain.ResumeRequest) (int64, error) {
 	a.deletionDestinations[input.MigrationID] = request.Destination
 	a.deletionMu.Unlock()
 	return id, nil
+}
+
+func (a *App) excludeDeliveredSourceNotice(migrationID int64, preflight *domain.PreflightResult) {
+	if a.db == nil || preflight == nil {
+		return
+	}
+	records, err := a.db.MailboxNoticeRecords(a.ctx, migrationID)
+	if err != nil {
+		return
+	}
+	for _, notice := range records {
+		if notice.Side != domain.MailboxNoticeSource || notice.Status != "delivered" {
+			continue
+		}
+		for index := range preflight.Source.Mailboxes {
+			mailbox := &preflight.Source.Mailboxes[index]
+			if !strings.EqualFold(mailbox.Name, "INBOX") || mailbox.Messages == 0 {
+				continue
+			}
+			mailbox.Messages--
+			preflight.Source.Messages = max(0, preflight.Source.Messages-1)
+			if notice.Size > 0 && mailbox.SizeKnown {
+				mailbox.Size = max(0, mailbox.Size-notice.Size)
+				preflight.Source.Bytes = max(0, preflight.Source.Bytes-notice.Size)
+			}
+			return
+		}
+	}
 }
 
 func (a *App) resolveResumeAccount(role string, persisted *domain.AccountConfig, visible domain.AccountConfig) error {
@@ -731,6 +812,86 @@ func (a *App) RecentMigrations() ([]domain.RecentMigration, error) {
 		return nil, err
 	}
 	return a.db.Recent(a.ctx, 20)
+}
+
+func (a *App) JobMailboxNotices(id int64) (domain.MailboxNoticeOverview, error) {
+	if err := a.ensureReady(); err != nil {
+		return domain.MailboxNoticeOverview{}, err
+	}
+	if id <= 0 {
+		return domain.MailboxNoticeOverview{}, errors.New("invalid migration ID")
+	}
+	migration, err := a.db.RecentByID(a.ctx, id)
+	if err != nil {
+		return domain.MailboxNoticeOverview{}, err
+	}
+	notices, err := a.db.MailboxNoticeStatuses(a.ctx, id)
+	if err != nil {
+		return domain.MailboxNoticeOverview{}, err
+	}
+	request, requestErr := a.db.LoadRequest(a.ctx, id)
+	overview := domain.MailboxNoticeOverview{
+		MigrationID: id, MigrationState: migration.State, Notices: notices,
+		Eligible:                  migration.State == domain.MigrationCompleted || migration.State == domain.MigrationCompletedWithErrors,
+		RequiresErrorConfirmation: migration.State == domain.MigrationCompletedWithErrors,
+	}
+	if requestErr == nil {
+		overview.SourceCredentialAvailable = a.credentialAvailable(request.Source.CredentialID)
+		overview.DestinationCredentialAvailable = a.credentialAvailable(request.Destination.CredentialID)
+	}
+	return overview, nil
+}
+
+func (a *App) FinalizeMailboxNotices(input domain.FinalizeMailboxNoticesRequest) (domain.MailboxNoticeOverview, error) {
+	if err := a.ensureReady(); err != nil {
+		return domain.MailboxNoticeOverview{}, err
+	}
+	overview, err := a.JobMailboxNotices(input.MigrationID)
+	if err != nil {
+		return overview, err
+	}
+	if !overview.Eligible {
+		return overview, errors.New("mailbox notices can only be finalized after a completed migration")
+	}
+	if overview.RequiresErrorConfirmation && !input.AllowCompletedWithErrors {
+		return overview, errors.New("confirm the completed-with-errors warning before finalizing mailbox notices")
+	}
+	hasPendingSource, hasPendingDestination := false, false
+	for _, notice := range overview.Notices {
+		if !notice.Enabled || notice.Status == "delivered" {
+			continue
+		}
+		if notice.Side == domain.MailboxNoticeSource {
+			hasPendingSource = true
+		} else if notice.Side == domain.MailboxNoticeDestination {
+			hasPendingDestination = true
+		}
+	}
+	if !hasPendingSource && !hasPendingDestination {
+		return overview, nil
+	}
+	request, err := a.db.LoadRequest(a.ctx, input.MigrationID)
+	if err != nil {
+		return overview, err
+	}
+	remember := input.RememberNewCredentials
+	if hasPendingSource {
+		if err := a.resolveResumeAccount("mail-source", &request.Source, domain.AccountConfig{Password: input.SourcePassword, RememberCredential: remember}); err != nil {
+			return overview, err
+		}
+	}
+	if hasPendingDestination {
+		if err := a.resolveResumeAccount("mail-destination", &request.Destination, domain.AccountConfig{Password: input.DestinationPassword, RememberCredential: remember}); err != nil {
+			return overview, err
+		}
+	}
+	if err := a.db.UpdateCredentialIDs(a.ctx, input.MigrationID, request.Source.CredentialID, request.Destination.CredentialID); err != nil {
+		return overview, err
+	}
+	if _, err := a.migrations.FinalizeMailboxNotices(a.ctx, input.MigrationID, request.Source, request.Destination, request.Options); err != nil {
+		return overview, err
+	}
+	return a.JobMailboxNotices(input.MigrationID)
 }
 
 func (a *App) JobMailIssues(id int64) ([]domain.MailIssue, error) {

@@ -95,6 +95,84 @@ func TestResolveResumeAccountAcceptsOneTimeMissingCredential(t *testing.T) {
 	}
 }
 
+func TestMailboxNoticeSettingsNormalizeAndLimitCustomText(t *testing.T) {
+	app := newResetTestApp(t, filepath.Join(t.TempDir(), "migrations.db"), &memoryCredentialStore{})
+	settings := domain.MailboxNoticeSettings{Source: domain.MailboxNoticeTemplate{Enabled: true, CustomText: "Line one\r\nLine two\rLine three"}}
+	if err := app.SaveMailboxNoticeSettings(settings); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := app.MailboxNoticeSettings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Source.CustomText != "Line one\nLine two\nLine three" {
+		t.Fatalf("newlines were not normalized: %q", loaded.Source.CustomText)
+	}
+	settings.Source.CustomText = strings.Repeat("ä", 10001)
+	if err := app.SaveMailboxNoticeSettings(settings); err == nil || !strings.Contains(err.Error(), "10,000") {
+		t.Fatalf("expected Unicode character limit, got %v", err)
+	}
+}
+
+func TestDeltaPreflightExcludesDeliveredSourceNoticeFromTotals(t *testing.T) {
+	app := newResetTestApp(t, filepath.Join(t.TempDir(), "migrations.db"), &memoryCredentialStore{})
+	request := domain.StartJobRequest{
+		MailEnabled:     true,
+		MailSource:      domain.AccountConfig{Host: "source", Port: 993, Encryption: domain.EncryptionTLS},
+		MailDestination: domain.AccountConfig{Host: "destination", Port: 993, Encryption: domain.EncryptionTLS},
+		Options:         domain.DefaultTransferOptions(),
+		MailboxNotices:  domain.MailboxNoticeSettings{Source: domain.MailboxNoticeTemplate{Enabled: true}},
+	}
+	id, err := app.db.CreateJob(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	records, err := app.db.MailboxNoticeRecords(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.db.CompleteMailboxNotice(context.Background(), records[1].ID, 10, 20, 300); err != nil {
+		t.Fatal(err)
+	}
+	preflight := domain.PreflightResult{Source: domain.ServerSummary{Messages: 5, Bytes: 1000, Mailboxes: []domain.Mailbox{{Name: "INBOX", Messages: 3, Size: 600, SizeKnown: true}}}}
+	app.excludeDeliveredSourceNotice(id, &preflight)
+	if preflight.Source.Messages != 4 || preflight.Source.Bytes != 700 || preflight.Source.Mailboxes[0].Messages != 2 || preflight.Source.Mailboxes[0].Size != 300 {
+		t.Fatalf("notice remained in delta totals: %#v", preflight.Source)
+	}
+}
+
+func TestMailboxNoticeCutoverEligibilityAndErrorConfirmation(t *testing.T) {
+	app := newResetTestApp(t, filepath.Join(t.TempDir(), "migrations.db"), &memoryCredentialStore{})
+	request := domain.StartJobRequest{
+		MailEnabled:     true,
+		MailSource:      domain.AccountConfig{Host: "source", Port: 993, Encryption: domain.EncryptionTLS},
+		MailDestination: domain.AccountConfig{Host: "destination", Port: 993, Encryption: domain.EncryptionTLS},
+		Options:         domain.DefaultTransferOptions(),
+		MailboxNotices:  domain.MailboxNoticeSettings{Destination: domain.MailboxNoticeTemplate{Enabled: true}},
+	}
+	id, err := app.db.CreateJob(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	overview, err := app.JobMailboxNotices(id)
+	if err != nil || overview.Eligible {
+		t.Fatalf("ready migration was eligible: %#v, %v", overview, err)
+	}
+	if _, err := app.FinalizeMailboxNotices(domain.FinalizeMailboxNoticesRequest{MigrationID: id}); err == nil || !strings.Contains(err.Error(), "completed migration") {
+		t.Fatalf("non-terminal cutover was not rejected: %v", err)
+	}
+	if err := app.db.MarkMigration(context.Background(), id, domain.MigrationCompletedWithErrors, "one item failed"); err != nil {
+		t.Fatal(err)
+	}
+	overview, err = app.JobMailboxNotices(id)
+	if err != nil || !overview.Eligible || !overview.RequiresErrorConfirmation {
+		t.Fatalf("completed-with-errors state was not exposed correctly: %#v, %v", overview, err)
+	}
+	if _, err := app.FinalizeMailboxNotices(domain.FinalizeMailboxNoticesRequest{MigrationID: id}); err == nil || !strings.Contains(err.Error(), "completed-with-errors") {
+		t.Fatalf("missing risk confirmation was not rejected: %v", err)
+	}
+}
+
 func TestCheckForUpdateCachesResult(t *testing.T) {
 	checker := &countingUpdateChecker{info: domain.UpdateInfo{CurrentVersion: "0.3.0", LatestVersion: "0.3.1", UpdateAvailable: true}}
 	app := &App{updateChecker: checker}
@@ -109,6 +187,10 @@ func TestResetMigrationDataClearsHistoryAndKeepsCredentials(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "migrations.db")
 	store := &memoryCredentialStore{values: map[string]string{"saved": "secret"}}
 	app := newResetTestApp(t, path, store)
+	noticeSettings := domain.MailboxNoticeSettings{Source: domain.MailboxNoticeTemplate{Enabled: true, CustomText: "Keep this setting"}}
+	if err := app.SaveMailboxNoticeSettings(noticeSettings); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := app.db.CreateMigration(context.Background(), domain.StartRequest{
 		Source:      domain.AccountConfig{Host: "source.example", Port: 993, Encryption: domain.EncryptionTLS},
 		Destination: domain.AccountConfig{Host: "destination.example", Port: 993, Encryption: domain.EncryptionTLS},
@@ -128,6 +210,9 @@ func TestResetMigrationDataClearsHistoryAndKeepsCredentials(t *testing.T) {
 	if store.values["saved"] != "secret" || store.deleteAllCalls != 0 {
 		t.Fatalf("credentials changed during migration reset: %#v", store)
 	}
+	if settings, err := app.MailboxNoticeSettings(); err != nil || settings != noticeSettings {
+		t.Fatalf("mailbox notice settings were not preserved: %#v, %v", settings, err)
+	}
 	if _, err := os.Stat(path + ".v3.bak"); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("schema backup still exists: %v", err)
 	}
@@ -137,6 +222,9 @@ func TestFactoryResetClearsCredentialsAndReloads(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "migrations.db")
 	store := &memoryCredentialStore{values: map[string]string{"saved": "secret"}}
 	app := newResetTestApp(t, path, store)
+	if err := app.SaveMailboxNoticeSettings(domain.MailboxNoticeSettings{Destination: domain.MailboxNoticeTemplate{Enabled: true, CustomText: "Delete this setting"}}); err != nil {
+		t.Fatal(err)
+	}
 	reloaded := false
 	app.reloadApplication = func(context.Context) { reloaded = true }
 	if err := app.FactoryReset(); err != nil {
@@ -147,6 +235,9 @@ func TestFactoryResetClearsCredentialsAndReloads(t *testing.T) {
 	}
 	if !reloaded {
 		t.Fatal("application reload was not requested")
+	}
+	if settings, err := app.MailboxNoticeSettings(); err != nil || settings != (domain.MailboxNoticeSettings{}) {
+		t.Fatalf("factory reset kept mailbox notice settings: %#v, %v", settings, err)
 	}
 }
 
@@ -264,8 +355,8 @@ func TestApplicationVersionsAreConsistent(t *testing.T) {
 		"frontend/package-lock.json":      lockfile["version"],
 		"frontend/package-lock.json root": lockRoot["version"],
 	} {
-		if version != "0.3.0" {
-			t.Errorf("%s has version %v, want 0.3.0", path, version)
+		if version != "0.4.0" {
+			t.Errorf("%s has version %v, want 0.4.0", path, version)
 		}
 	}
 }

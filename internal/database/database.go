@@ -18,7 +18,7 @@ import (
 	"github.com/tenbyte/mail-migrator/internal/domain"
 )
 
-const schemaVersion = 4
+const schemaVersion = 5
 
 type DB struct{ sql *sql.DB }
 
@@ -196,6 +196,13 @@ func (d *DB) migrate(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS messages_pending_idx ON messages(migration_id, status)`,
 		`CREATE TABLE IF NOT EXISTS errors (id INTEGER PRIMARY KEY AUTOINCREMENT, migration_id INTEGER NOT NULL REFERENCES migrations(id) ON DELETE CASCADE, folder_id INTEGER, source_uid INTEGER, level TEXT NOT NULL, code TEXT NOT NULL DEFAULT '', message TEXT NOT NULL, created_at TEXT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS mailbox_notices (
+			id INTEGER PRIMARY KEY AUTOINCREMENT, migration_id INTEGER NOT NULL REFERENCES migrations(id) ON DELETE CASCADE,
+			side TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 0, custom_text TEXT NOT NULL DEFAULT '',
+			subject TEXT NOT NULL, message_id TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'pending',
+			uid INTEGER NOT NULL DEFAULT 0, uid_validity INTEGER NOT NULL DEFAULT 0, size INTEGER NOT NULL DEFAULT 0,
+			last_error TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, delivered_at TEXT,
+			UNIQUE(migration_id, side))`,
 		`CREATE TABLE IF NOT EXISTS migration_services (
 			id INTEGER PRIMARY KEY AUTOINCREMENT, migration_id INTEGER NOT NULL REFERENCES migrations(id) ON DELETE CASCADE,
 			kind TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'READY',
@@ -685,6 +692,11 @@ func (d *DB) SetDestinationUIDValidity(ctx context.Context, folderID int64, uidV
 	return err
 }
 
+func (d *DB) AdvanceFolderUID(ctx context.Context, folderID int64, sourceUID uint32) error {
+	_, err := d.sql.ExecContext(ctx, `UPDATE folders SET last_synced_source_uid=MAX(last_synced_source_uid,?) WHERE id=?`, sourceUID, folderID)
+	return err
+}
+
 func (d *DB) UnfinishedUIDs(ctx context.Context, migrationID, folderID int64, uidValidity uint32) ([]uint32, error) {
 	rows, err := d.sql.QueryContext(ctx, `SELECT source_uid FROM messages WHERE migration_id=? AND folder_id=? AND source_uidvalidity=? AND (status IN (?,?,?,?) OR policy_override<>'') ORDER BY source_uid`, migrationID, folderID, uidValidity, domain.MessagePending, domain.MessageRetryPending, domain.MessageTransferring, domain.MessageUnknown)
 	if err != nil {
@@ -788,6 +800,7 @@ func (d *DB) Recent(ctx context.Context, limit int) ([]domain.RecentMigration, e
 	_ = rows.Close()
 	for i := range result {
 		result[i].Services, _ = d.JobServices(ctx, result[i].ID)
+		_ = d.sql.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM mailbox_notices WHERE migration_id=? AND enabled=1)`, result[i].ID).Scan(&result[i].MailboxNoticesEnabled)
 	}
 	return result, nil
 }
@@ -845,6 +858,7 @@ func (d *DB) Report(ctx context.Context, id int64) (domain.Report, error) {
 	_ = d.sql.QueryRowContext(ctx, `SELECT COUNT(*) FROM mail_source_deletions WHERE migration_id=? AND status='deleted'`, id).Scan(&report.SourceDeletionsDeleted)
 	_ = d.sql.QueryRowContext(ctx, `SELECT COUNT(*) FROM mail_source_deletions WHERE migration_id=? AND status='failed'`, id).Scan(&report.SourceDeletionErrors)
 	report.MailIssues, _ = d.MailIssues(ctx, id)
+	report.MailboxNotices, _ = d.MailboxNoticeStatuses(ctx, id)
 	if migration.MessagesFailed == 0 && migration.MessagesCopied == migration.MessagesTotal && report.VerificationFailed == 0 && report.Unknown == 0 && report.Quarantined == 0 {
 		report.Verification = "All tracked source objects were transferred successfully and verified using the selected mode."
 	} else {

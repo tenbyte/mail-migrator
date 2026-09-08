@@ -45,6 +45,8 @@ Dependency changes are made manually. CI still runs `npm audit` and `govulncheck
 4. Confirm that generated SBOM files and binaries are not staged.
 5. Tag the verified commit as `vX.Y.Z` and push the tag. The release workflow verifies the version, builds Windows and macOS packages, creates SHA-256 checksums, includes `LICENSE` and `NOTICE`, and publishes a non-draft GitHub release.
 
+For mailbox-notice releases, also verify with two disposable IMAP accounts before tagging: both switch combinations, plaintext and HTML rendering, custom-text escaping, the completed-with-errors warning, a retry after an uncertain APPEND without duplicates, and a later delta sync that neither transfers nor counts the source notice.
+
 The application reads only GitHub's latest stable release endpoint. Drafts and prereleases do not produce an update notice.
 
 The release packages are unsigned unless platform signing credentials are added to the workflow. Windows SmartScreen and macOS Gatekeeper may therefore warn users even when the checksum is correct. Do not describe a build as signed or notarized until the corresponding signing step is configured and verified.

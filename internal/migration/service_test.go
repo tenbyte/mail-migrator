@@ -82,6 +82,9 @@ func (c *reconciliationClient) StreamMessage(_ context.Context, uid uint32, cons
 func (c *reconciliationClient) AppendMessage(context.Context, string, mailimap.MessageMetadata, io.Reader, []string, []string) (mailimap.AppendResult, error) {
 	return mailimap.AppendResult{}, nil
 }
+func (c *reconciliationClient) FindMessageByID(context.Context, string, string) (uint32, uint32, error) {
+	return c.uidValidity, 0, nil
+}
 func (c *reconciliationClient) FindCandidate(_ context.Context, _ string, metadata mailimap.MessageMetadata) (mailimap.Candidate, error) {
 	return c.candidates[metadata.MessageID], nil
 }
@@ -98,6 +101,56 @@ type staticFactory struct{ client mailimap.Client }
 
 func (f staticFactory) Connect(context.Context, domain.AccountConfig, time.Duration, time.Duration) (mailimap.Client, error) {
 	return f.client, nil
+}
+
+type noticeClient struct {
+	*reconciliationClient
+	existingUID uint32
+	findUIDs    []uint32
+	appendUID   uint32
+	appendErr   error
+	appendCalls int
+	appendFlags [][]string
+	appended    [][]byte
+}
+
+func (c *noticeClient) FindMessageByID(context.Context, string, string) (uint32, uint32, error) {
+	if len(c.findUIDs) > 0 {
+		uid := c.findUIDs[0]
+		c.findUIDs = c.findUIDs[1:]
+		return c.uidValidity, uid, nil
+	}
+	return c.uidValidity, c.existingUID, nil
+}
+
+func (c *noticeClient) AppendMessage(_ context.Context, _ string, _ mailimap.MessageMetadata, reader io.Reader, flags, _ []string) (mailimap.AppendResult, error) {
+	raw, err := io.ReadAll(reader)
+	if err != nil {
+		return mailimap.AppendResult{}, err
+	}
+	c.appendCalls++
+	c.appendFlags = append(c.appendFlags, flags)
+	c.appended = append(c.appended, raw)
+	if c.appendErr != nil {
+		return mailimap.AppendResult{}, c.appendErr
+	}
+	uid := c.appendUID
+	if uid == 0 {
+		uid = 41
+	}
+	return mailimap.AppendResult{UIDValidity: c.uidValidity, UID: uid}, nil
+}
+
+type noticeFactory struct {
+	clients map[string]*noticeClient
+	order   *[]string
+}
+
+func (f noticeFactory) Connect(_ context.Context, account domain.AccountConfig, _, _ time.Duration) (mailimap.Client, error) {
+	if f.order != nil {
+		*f.order = append(*f.order, account.Host)
+	}
+	return f.clients[account.Host], nil
 }
 
 type mutationClient struct {
@@ -457,6 +510,38 @@ func TestReconcileFolderDetectsSourceDeletionAndRemembersKeep(t *testing.T) {
 	report, err := db.Report(ctx, migrationID)
 	if err != nil || report.SourceDeletionsKept != 1 {
 		t.Fatalf("keep decision missing from report: %#v, %v", report, err)
+	}
+}
+
+func TestReconcileFolderIgnoresUntrackedDestinationOnlyMessages(t *testing.T) {
+	db, err := database.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	request := domain.StartRequest{
+		Source:      domain.AccountConfig{Host: "source", Port: 993, Encryption: domain.EncryptionTLS},
+		Destination: domain.AccountConfig{Host: "destination", Port: 993, Encryption: domain.EncryptionTLS},
+		Mappings:    []domain.FolderMapping{{Source: domain.Mailbox{Name: "INBOX", UIDValidity: 7, Selectable: true}, DestinationName: "INBOX", Enabled: true}},
+		Options:     domain.DefaultTransferOptions(), Mode: "reconcile",
+	}
+	migrationID, err := db.CreateMigration(ctx, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	folders, err := db.Folders(ctx, migrationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &reconciliationClient{uids: []uint32{500}, uidValidity: 9, metadata: map[uint32]mailimap.MessageMetadata{500: {UID: 500, Size: 123, SizeKnown: true, MessageID: "<new-at-destination>"}}}
+	service := New(db, nil, nil)
+	if err := service.reconcileFolder(ctx, migrationID, request, folders[0], 7, 9, nil, client, &atomic.Int64{}, &atomic.Int64{}, &atomic.Int64{}); err != nil {
+		t.Fatal(err)
+	}
+	items, err := db.SourceDeletions(ctx, migrationID)
+	if err != nil || len(items) != 0 {
+		t.Fatalf("destination-only message was treated as a source deletion: %#v, %v", items, err)
 	}
 }
 

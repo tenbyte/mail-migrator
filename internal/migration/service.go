@@ -407,6 +407,7 @@ func (s *Service) run(ctx context.Context, id int64, request domain.StartRequest
 		_ = s.db.MarkMigration(context.Background(), id, domain.MigrationFailed, message)
 		return
 	}
+	noticeMessageIDs, _ := s.db.SourceMailboxNoticeMessageIDs(ctx, id)
 	if request.Mode == "reconcile" {
 		var tracked int64
 		for _, folder := range records {
@@ -430,7 +431,7 @@ func (s *Service) run(ctx context.Context, id int64, request domain.StartRequest
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			s.worker(ctx, id, request, control, jobs, duplicateIndexes, &copiedBytes, &copiedMessages, &failedMessages, &runItemsTotal, &runItemsDone, lastFailure, emit)
+			s.worker(ctx, id, request, control, jobs, duplicateIndexes, noticeMessageIDs, &copiedBytes, &copiedMessages, &failedMessages, &runItemsTotal, &runItemsDone, lastFailure, emit)
 		}()
 	}
 dispatch:
@@ -774,7 +775,7 @@ func (s *Service) recordFolderFailure(id int64, request domain.StartRequest, fol
 	emit(folderName, 0, domain.MigrationRunning, "["+code+"] "+message)
 }
 
-func (s *Service) worker(ctx context.Context, id int64, request domain.StartRequest, control *runControl, jobs <-chan database.FolderRecord, duplicateIndexes *duplicateIndexCache, copiedBytes, copiedMessages, failedMessages, runItemsTotal, runItemsDone *atomic.Int64, lastFailure *runFailure, emit emitFunc) {
+func (s *Service) worker(ctx context.Context, id int64, request domain.StartRequest, control *runControl, jobs <-chan database.FolderRecord, duplicateIndexes *duplicateIndexCache, noticeMessageIDs map[string]struct{}, copiedBytes, copiedMessages, failedMessages, runItemsTotal, runItemsDone *atomic.Int64, lastFailure *runFailure, emit emitFunc) {
 	connect := func() (mailimap.Client, mailimap.Client, error) {
 		timeout := time.Duration(request.Options.ConnectionTimeout) * time.Second
 		stall := time.Duration(request.Options.StallTimeout) * time.Second
@@ -895,6 +896,14 @@ func (s *Service) worker(ctx context.Context, id int64, request domain.StartRequ
 				_ = s.db.RecordMessageIssue(ctx, id, folder.ID, uidValidity, uid, 0, "", time.Time{}, state, code, security.SanitizeLogValue(err.Error()))
 				failedMessages.Add(1)
 				emit(folder.SourceName, uid, domain.MigrationRunning, "["+code+"] The message could not be inventoried at the source.")
+				continue
+			}
+			if _, generated := noticeMessageIDs[strings.ToLower(strings.TrimSpace(meta.MessageID))]; generated {
+				if request.Mode == "reconcile" {
+					runItemsDone.Add(-1)
+					runItemsTotal.Add(-1)
+				}
+				_ = s.db.AdvanceFolderUID(ctx, folder.ID, uid)
 				continue
 			}
 			existing, _ := s.db.MessageTransfer(ctx, id, folder.ID, uidValidity, uid)

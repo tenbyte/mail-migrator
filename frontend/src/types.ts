@@ -18,6 +18,24 @@ export interface AccountConfig {
   credentialId?: string
 }
 
+export interface MailboxNoticeTemplate { enabled: boolean; customText: string }
+export interface MailboxNoticeSettings { source: MailboxNoticeTemplate; destination: MailboxNoticeTemplate }
+export type MailboxNoticeSide = 'source' | 'destination'
+export interface MailboxNoticeSnapshot {
+  side: MailboxNoticeSide; enabled: boolean; customText?: string; subject: string; messageId?: string
+}
+export interface MailboxNoticeStatus extends MailboxNoticeSnapshot {
+  status: 'pending' | 'delivered' | 'failed'; lastError?: string; deliveredAt?: string
+}
+export interface MailboxNoticeOverview {
+  migrationId: number; migrationState: string; eligible: boolean; requiresErrorConfirmation: boolean
+  sourceCredentialAvailable: boolean; destinationCredentialAvailable: boolean; notices: MailboxNoticeStatus[]
+}
+export interface FinalizeMailboxNoticesRequest {
+  migrationId: number; sourcePassword?: string; destinationPassword?: string; rememberNewCredentials: boolean
+  allowCompletedWithErrors: boolean
+}
+
 export interface DAVEndpoint {
   url: string
   username: string
@@ -72,6 +90,7 @@ export interface RecentMigration {
   id: number; createdAt: string; finishedAt?: string; state: string; sourceHost: string; destinationHost: string
   sourceUsername: string; destinationUsername: string
   messagesTotal: number; messagesCopied: number; messagesFailed: number; bytesTotal: number; bytesCopied: number; services?: ServiceKind[]
+  mailboxNoticesEnabled?: boolean
 }
 export interface Conflict { id: number; migrationId: number; kind: ServiceKind; resourceHref: string; sourceEtag: string; destinationEtag: string; resolution?: string }
 export type MailIssueResolution = 'transfer_anyway' | 'retry' | 'verify_again' | 'keep_skipped'
@@ -91,7 +110,7 @@ export interface ResolveSourceDeletionsRequest { migrationId: number; actions: S
 
 export interface StartJobRequest {
   mailEnabled: boolean; mailSource: AccountConfig; mailDestination: AccountConfig; mailMappings: FolderMapping[]
-  calendar: DAVServiceRequest; contacts: DAVServiceRequest; options: TransferOptions; migrationId?: number; mode?: string
+  calendar: DAVServiceRequest; contacts: DAVServiceRequest; options: TransferOptions; mailboxNotices: MailboxNoticeSettings; migrationId?: number; mode?: string
 }
 
 export interface CredentialRequirement {
