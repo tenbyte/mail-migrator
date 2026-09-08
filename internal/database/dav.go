@@ -93,6 +93,11 @@ func (d *DB) ConfigureJob(ctx context.Context, migrationID int64, request domain
 			}
 		}
 	}
+	if request.MailEnabled {
+		if err := configureMailboxNotices(ctx, tx, migrationID, request.MailboxNotices); err != nil {
+			return err
+		}
+	}
 	var totalItems, totalBytes int64
 	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(items_total),0),COALESCE(SUM(bytes_total),0) FROM migration_services WHERE migration_id=?`, migrationID).Scan(&totalItems, &totalBytes); err != nil {
 		return err

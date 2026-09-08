@@ -33,6 +33,58 @@ type AccountConfig struct {
 	CredentialID       string     `json:"credentialId,omitempty"`
 }
 
+type MailboxNoticeSide string
+
+const (
+	MailboxNoticeSource             MailboxNoticeSide = "source"
+	MailboxNoticeDestination        MailboxNoticeSide = "destination"
+	MailboxNoticeSourceSubject                        = "Your mailbox has been migrated"
+	MailboxNoticeDestinationSubject                   = "Please check your migrated mailbox"
+)
+
+type MailboxNoticeTemplate struct {
+	Enabled    bool   `json:"enabled"`
+	CustomText string `json:"customText"`
+}
+
+type MailboxNoticeSettings struct {
+	Source      MailboxNoticeTemplate `json:"source"`
+	Destination MailboxNoticeTemplate `json:"destination"`
+}
+
+type MailboxNoticeSnapshot struct {
+	Side       MailboxNoticeSide `json:"side"`
+	Enabled    bool              `json:"enabled"`
+	CustomText string            `json:"customText,omitempty"`
+	Subject    string            `json:"subject"`
+	MessageID  string            `json:"messageId,omitempty"`
+}
+
+type MailboxNoticeStatus struct {
+	MailboxNoticeSnapshot
+	Status      string     `json:"status"`
+	LastError   string     `json:"lastError,omitempty"`
+	DeliveredAt *time.Time `json:"deliveredAt,omitempty"`
+}
+
+type MailboxNoticeOverview struct {
+	MigrationID                    int64                 `json:"migrationId"`
+	MigrationState                 MigrationState        `json:"migrationState"`
+	Eligible                       bool                  `json:"eligible"`
+	RequiresErrorConfirmation      bool                  `json:"requiresErrorConfirmation"`
+	SourceCredentialAvailable      bool                  `json:"sourceCredentialAvailable"`
+	DestinationCredentialAvailable bool                  `json:"destinationCredentialAvailable"`
+	Notices                        []MailboxNoticeStatus `json:"notices"`
+}
+
+type FinalizeMailboxNoticesRequest struct {
+	MigrationID              int64  `json:"migrationId"`
+	SourcePassword           string `json:"sourcePassword,omitempty"`
+	DestinationPassword      string `json:"destinationPassword,omitempty"`
+	RememberNewCredentials   bool   `json:"rememberNewCredentials"`
+	AllowCompletedWithErrors bool   `json:"allowCompletedWithErrors"`
+}
+
 type Mailbox struct {
 	Name        string   `json:"name"`
 	Delimiter   rune     `json:"delimiter"`
@@ -203,46 +255,48 @@ type ServiceProgress struct {
 }
 
 type RecentMigration struct {
-	ID                  int64          `json:"id"`
-	CreatedAt           time.Time      `json:"createdAt"`
-	FinishedAt          *time.Time     `json:"finishedAt,omitempty"`
-	State               MigrationState `json:"state"`
-	SourceHost          string         `json:"sourceHost"`
-	DestinationHost     string         `json:"destinationHost"`
-	SourceUsername      string         `json:"sourceUsername"`
-	DestinationUsername string         `json:"destinationUsername"`
-	MessagesTotal       int64          `json:"messagesTotal"`
-	MessagesCopied      int64          `json:"messagesCopied"`
-	MessagesFailed      int64          `json:"messagesFailed"`
-	BytesTotal          int64          `json:"bytesTotal"`
-	BytesCopied         int64          `json:"bytesCopied"`
-	Services            []ServiceKind  `json:"services,omitempty"`
+	ID                    int64          `json:"id"`
+	CreatedAt             time.Time      `json:"createdAt"`
+	FinishedAt            *time.Time     `json:"finishedAt,omitempty"`
+	State                 MigrationState `json:"state"`
+	SourceHost            string         `json:"sourceHost"`
+	DestinationHost       string         `json:"destinationHost"`
+	SourceUsername        string         `json:"sourceUsername"`
+	DestinationUsername   string         `json:"destinationUsername"`
+	MessagesTotal         int64          `json:"messagesTotal"`
+	MessagesCopied        int64          `json:"messagesCopied"`
+	MessagesFailed        int64          `json:"messagesFailed"`
+	BytesTotal            int64          `json:"bytesTotal"`
+	BytesCopied           int64          `json:"bytesCopied"`
+	Services              []ServiceKind  `json:"services,omitempty"`
+	MailboxNoticesEnabled bool           `json:"mailboxNoticesEnabled,omitempty"`
 }
 
 type Report struct {
-	Migration              RecentMigration   `json:"migration"`
-	Folders                int64             `json:"folders"`
-	Warnings               int64             `json:"warnings"`
-	Errors                 int64             `json:"errors"`
-	Verification           string            `json:"verification"`
-	Services               []ServiceProgress `json:"services,omitempty"`
-	Updated                int64             `json:"updated"`
-	Converted              int64             `json:"converted"`
-	Skipped                int64             `json:"skipped"`
-	Conflicts              int64             `json:"conflicts"`
-	Repaired               int64             `json:"repaired"`
-	Verified               int64             `json:"verified"`
-	Quarantined            int64             `json:"quarantined"`
-	Unknown                int64             `json:"unknown"`
-	VerificationFailed     int64             `json:"verificationFailed"`
-	Deduplicated           int64             `json:"deduplicated"`
-	WarningDetails         []ReportEvent     `json:"warningDetails"`
-	ErrorDetails           []ReportEvent     `json:"errorDetails"`
-	MailIssues             []MailIssue       `json:"mailIssues,omitempty"`
-	SourceDeletionsKept    int64             `json:"sourceDeletionsKept"`
-	SourceDeletionsTrashed int64             `json:"sourceDeletionsTrashed"`
-	SourceDeletionsDeleted int64             `json:"sourceDeletionsDeleted"`
-	SourceDeletionErrors   int64             `json:"sourceDeletionErrors"`
+	Migration              RecentMigration       `json:"migration"`
+	Folders                int64                 `json:"folders"`
+	Warnings               int64                 `json:"warnings"`
+	Errors                 int64                 `json:"errors"`
+	Verification           string                `json:"verification"`
+	Services               []ServiceProgress     `json:"services,omitempty"`
+	Updated                int64                 `json:"updated"`
+	Converted              int64                 `json:"converted"`
+	Skipped                int64                 `json:"skipped"`
+	Conflicts              int64                 `json:"conflicts"`
+	Repaired               int64                 `json:"repaired"`
+	Verified               int64                 `json:"verified"`
+	Quarantined            int64                 `json:"quarantined"`
+	Unknown                int64                 `json:"unknown"`
+	VerificationFailed     int64                 `json:"verificationFailed"`
+	Deduplicated           int64                 `json:"deduplicated"`
+	WarningDetails         []ReportEvent         `json:"warningDetails"`
+	ErrorDetails           []ReportEvent         `json:"errorDetails"`
+	MailIssues             []MailIssue           `json:"mailIssues,omitempty"`
+	SourceDeletionsKept    int64                 `json:"sourceDeletionsKept"`
+	SourceDeletionsTrashed int64                 `json:"sourceDeletionsTrashed"`
+	SourceDeletionsDeleted int64                 `json:"sourceDeletionsDeleted"`
+	SourceDeletionErrors   int64                 `json:"sourceDeletionErrors"`
+	MailboxNotices         []MailboxNoticeStatus `json:"mailboxNotices,omitempty"`
 }
 
 type ReportEvent struct {
@@ -426,15 +480,16 @@ type JobPreflightResult struct {
 }
 
 type StartJobRequest struct {
-	MailEnabled     bool              `json:"mailEnabled"`
-	MailSource      AccountConfig     `json:"mailSource"`
-	MailDestination AccountConfig     `json:"mailDestination"`
-	MailMappings    []FolderMapping   `json:"mailMappings"`
-	Calendar        DAVServiceRequest `json:"calendar"`
-	Contacts        DAVServiceRequest `json:"contacts"`
-	Options         TransferOptions   `json:"options"`
-	MigrationID     int64             `json:"migrationId,omitempty"`
-	Mode            string            `json:"mode,omitempty"`
+	MailEnabled     bool                  `json:"mailEnabled"`
+	MailSource      AccountConfig         `json:"mailSource"`
+	MailDestination AccountConfig         `json:"mailDestination"`
+	MailMappings    []FolderMapping       `json:"mailMappings"`
+	Calendar        DAVServiceRequest     `json:"calendar"`
+	Contacts        DAVServiceRequest     `json:"contacts"`
+	Options         TransferOptions       `json:"options"`
+	MailboxNotices  MailboxNoticeSettings `json:"mailboxNotices"`
+	MigrationID     int64                 `json:"migrationId,omitempty"`
+	Mode            string                `json:"mode,omitempty"`
 }
 
 type DAVResourceState struct {

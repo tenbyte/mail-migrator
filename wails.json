@@ -12,7 +12,7 @@
   "info": {
     "companyName": "Tenbyte",
     "productName": "Tenbyte Mail Migrator",
-    "productVersion": "0.3.0",
+    "productVersion": "0.4.0",
     "copyright": "Copyright 2026 Tenbyte",
     "comments": "Desktop application for mailbox migrations"
   }

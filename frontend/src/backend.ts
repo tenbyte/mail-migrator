@@ -1,10 +1,12 @@
 import type {
   AccountConfig, Conflict, DAVAccountSummary, DAVEndpoint, DAVServiceRequest, JobPreflightResult, Progress,
-  MailIssue, MailIssueResolution, RecentMigration, ResolveSourceDeletionsRequest, ResumeJobRequest, ResumeRequirements, ServiceKind, SourceDeletion, StartJobRequest, TransferOptions, UpdateInfo,
+  FinalizeMailboxNoticesRequest, MailboxNoticeOverview, MailboxNoticeSettings, MailIssue, MailIssueResolution, RecentMigration, ResolveSourceDeletionsRequest, ResumeJobRequest, ResumeRequirements, ServiceKind, SourceDeletion, StartJobRequest, TransferOptions, UpdateInfo,
 } from './types'
 
 type Backend = {
   Defaults(): Promise<TransferOptions>
+  MailboxNoticeSettings(): Promise<MailboxNoticeSettings>
+  SaveMailboxNoticeSettings(settings: MailboxNoticeSettings): Promise<void>
   CheckForUpdate(): Promise<UpdateInfo>
   OpenLatestRelease(): Promise<void>
   TestAccount(account: AccountConfig): Promise<import('./types').ServerSummary>
@@ -27,6 +29,8 @@ type Backend = {
   JobMailIssues(id: number): Promise<MailIssue[]>
   ResolveMailIssue(id: number, resolution: MailIssueResolution): Promise<void>
   JobSourceDeletions(id: number): Promise<SourceDeletion[]>
+  JobMailboxNotices(id: number): Promise<MailboxNoticeOverview>
+  FinalizeMailboxNotices(request: FinalizeMailboxNoticesRequest): Promise<MailboxNoticeOverview>
   ResolveSourceDeletions(request: ResolveSourceDeletionsRequest): Promise<void>
   DiscardSourceDeletionCredential(id: number): Promise<void>
   ResetMigrationData(): Promise<void>
@@ -53,6 +57,8 @@ function call<T>(operation: (desktop: Backend) => Promise<T>): Promise<T> {
 export const backend = {
   available: () => Boolean(window.go?.main?.App),
   defaults: () => call(desktop => desktop.Defaults()),
+  mailboxNoticeSettings: () => call(desktop => desktop.MailboxNoticeSettings()),
+  saveMailboxNoticeSettings: (settings: MailboxNoticeSettings) => call(desktop => desktop.SaveMailboxNoticeSettings(settings)),
   checkForUpdate: () => call(desktop => desktop.CheckForUpdate()),
   openLatestRelease: () => call(desktop => desktop.OpenLatestRelease()),
   testMail: (account: AccountConfig) => call(desktop => desktop.TestAccount(account)),
@@ -72,6 +78,8 @@ export const backend = {
   mailIssues: (id: number) => call(desktop => desktop.JobMailIssues(id)).then(items => items ?? []),
   resolveMailIssue: (id: number, resolution: MailIssueResolution) => call(desktop => desktop.ResolveMailIssue(id, resolution)),
   sourceDeletions: (id: number) => call(desktop => desktop.JobSourceDeletions(id)).then(items => items ?? []),
+  mailboxNotices: (id: number) => call(desktop => desktop.JobMailboxNotices(id)),
+  finalizeMailboxNotices: (request: FinalizeMailboxNoticesRequest) => call(desktop => desktop.FinalizeMailboxNotices(request)),
   resolveSourceDeletions: (request: ResolveSourceDeletionsRequest) => call(desktop => desktop.ResolveSourceDeletions(request)),
   discardSourceDeletionCredential: (id: number) => call(desktop => desktop.DiscardSourceDeletionCredential(id)),
   resetMigrationData: () => call(desktop => desktop.ResetMigrationData()),

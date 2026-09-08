@@ -15,7 +15,7 @@ Direct dependencies are pinned in `go.mod` and `frontend/package-lock.json`. Gen
 | go-ical | `439c63cef608` | iCalendar processing | MIT |
 | go-vcard | 0.1.0 | vCard processing | MIT |
 | go-keyring | 0.2.8 | Operating system credential store | MIT |
-| modernc.org/sqlite | 1.57.0 | Embedded SQLite database | BSD-3-Clause |
+| modernc.org/sqlite | 1.58.0 | Embedded SQLite database | BSD-3-Clause |
 | golang.org/x/text | 0.41.0 | Text processing | BSD-3-Clause |
 | golang.org/x/mod | 0.40.0 | Semantic version comparison | BSD-3-Clause |
 
@@ -26,6 +26,6 @@ Direct dependencies are pinned in `go.mod` and `frontend/package-lock.json`. Gen
 | React and React DOM | 19.2.8 | User interface | MIT |
 | Sonner | 2.0.8 | Notifications | MIT |
 
-The frontend toolchain uses TypeScript 6.0.3, Vite 8.2.2, Vitest 4.1.11, ESLint 10.9.1, and typescript-eslint 8.69.0. TypeScript remains on 6.0 because TypeScript 7 is outside the supported typescript-eslint parser range.
+The frontend toolchain uses TypeScript 6.0.3, Vite 8.2.2, Vitest 5.0.0, ESLint 10.10.0, and typescript-eslint 8.69.0. TypeScript remains on 6.0 because TypeScript 7 is outside the supported typescript-eslint parser range. The Wails dependency graph resolves Echo 4.15.4.
 
 Wails v2 remains the supported desktop framework. Wails v3 is a separate beta line and requires a deliberate application migration rather than a dependency-only update. See the [Wails v3 status](https://v3.wails.io/blog/).

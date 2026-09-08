@@ -84,6 +84,7 @@ type Client interface {
 	FetchMessageID(context.Context, uint32) (string, error)
 	StreamMessage(context.Context, uint32, func(io.Reader, int64) error) error
 	AppendMessage(context.Context, string, MessageMetadata, io.Reader, []string, []string) (AppendResult, error)
+	FindMessageByID(context.Context, string, string) (uidValidity, uid uint32, err error)
 	FindCandidate(context.Context, string, MessageMetadata) (Candidate, error)
 	CreateMailbox(context.Context, string) error
 	Limits(context.Context, string) (MailboxLimits, error)
@@ -677,6 +678,26 @@ func (c *realClient) FindCandidate(ctx context.Context, mailbox string, meta Mes
 		}
 	}
 	return match, nil
+}
+
+func (c *realClient) FindMessageByID(ctx context.Context, mailbox, messageID string) (uint32, uint32, error) {
+	if strings.TrimSpace(messageID) == "" {
+		return 0, 0, errors.New("message ID is required")
+	}
+	uidValidity, _, _, err := c.SelectMailbox(ctx, mailbox, true)
+	if err != nil {
+		return 0, 0, err
+	}
+	criteria := &imap.SearchCriteria{Header: []imap.SearchCriteriaHeaderField{{Key: "Message-ID", Value: messageID}}}
+	data, err := c.client.UIDSearch(criteria, &imap.SearchOptions{ReturnAll: true}).Wait()
+	if err != nil {
+		return 0, 0, fmt.Errorf("find mailbox notice: %w", err)
+	}
+	uids := data.AllUIDs()
+	if len(uids) == 0 {
+		return uidValidity, 0, nil
+	}
+	return uidValidity, uint32(uids[0]), nil
 }
 
 func (c *realClient) CreateMailbox(ctx context.Context, name string) error {
