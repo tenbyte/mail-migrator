@@ -3,10 +3,13 @@ WAILS_VERSION := v2.15.0
 GOVULNCHECK_VERSION := v1.7.0
 CYCLONEDX_VERSION := v1.12.0
 
-.PHONY: dev test test-race lint audit sbom frontend build-macos build-windows clean
+.PHONY: dev dev-debug test test-race lint audit sbom frontend build-macos build-windows clean
 
 dev:
 	GOTOOLCHAIN=go1.27.0 $(GO) run github.com/wailsapp/wails/v2/cmd/wails@$(WAILS_VERSION) dev
+
+dev-debug:
+	TENBYTE_LOG_LEVEL=debug GOTOOLCHAIN=go1.27.0 $(GO) run github.com/wailsapp/wails/v2/cmd/wails@$(WAILS_VERSION) dev -devserver localhost:34116 -loglevel Debug -v 2 -nocolour
 
 frontend:
 	cd frontend && npm ci && npm run build

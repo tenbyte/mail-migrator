@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/tenbyte/mail-migrator/internal/database"
+	"github.com/tenbyte/mail-migrator/internal/diagnostics"
 	"github.com/tenbyte/mail-migrator/internal/domain"
 	"github.com/tenbyte/mail-migrator/internal/folders"
 	"github.com/tenbyte/mail-migrator/internal/mailimap"
@@ -24,11 +26,12 @@ import (
 type EventSink func(domain.Progress)
 
 type Service struct {
-	db      *database.DB
-	factory mailimap.Factory
-	events  EventSink
-	mu      sync.Mutex
-	runs    map[int64]*runControl
+	db          *database.DB
+	factory     mailimap.Factory
+	events      EventSink
+	diagnostics *diagnostics.Manager
+	mu          sync.Mutex
+	runs        map[int64]*runControl
 }
 
 type runControl struct {
@@ -54,8 +57,12 @@ func (failure *runFailure) get() string {
 	return failure.message
 }
 
-func New(db *database.DB, factory mailimap.Factory, events EventSink) *Service {
-	return &Service{db: db, factory: factory, events: events, runs: make(map[int64]*runControl)}
+func New(db *database.DB, factory mailimap.Factory, events EventSink, managers ...*diagnostics.Manager) *Service {
+	var manager *diagnostics.Manager
+	if len(managers) > 0 {
+		manager = managers[0]
+	}
+	return &Service{db: db, factory: factory, events: events, diagnostics: manager, runs: make(map[int64]*runControl)}
 }
 
 func (s *Service) Active() bool {
@@ -94,6 +101,9 @@ func (s *Service) Inspect(ctx context.Context, account domain.AccountConfig) (do
 }
 
 func (s *Service) Preflight(ctx context.Context, source, destination domain.AccountConfig) (domain.PreflightResult, error) {
+	if s.diagnostics != nil {
+		s.diagnostics.Protect(source.Host, source.Username, source.Password, source.CredentialID, destination.Host, destination.Username, destination.Password, destination.CredentialID)
+	}
 	type sideResult struct {
 		source   bool
 		summary  domain.ServerSummary
@@ -150,8 +160,19 @@ func (s *Service) Preflight(ctx context.Context, source, destination domain.Acco
 		}
 		results <- sideResult{source: sourceSide, summary: summary}
 	}
-	go check(source, true)
-	go check(destination, false)
+	runCheck := func(account domain.AccountConfig, sourceSide bool) {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				if s.diagnostics != nil {
+					s.diagnostics.RecordPanic("mail_preflight", 0, string(domain.ServiceMail), recovered, debug.Stack())
+				}
+				results <- sideResult{source: sourceSide, err: errors.New("internal error during mail preflight")}
+			}
+		}()
+		check(account, sourceSide)
+	}
+	go runCheck(source, true)
+	go runCheck(destination, false)
 	first, second := <-results, <-results
 	if first.err != nil {
 		return domain.PreflightResult{}, first.err
@@ -273,6 +294,12 @@ func summarize(host string, caps []string, mailboxes []domain.Mailbox) domain.Se
 }
 
 func (s *Service) Start(parent context.Context, request domain.StartRequest) (int64, error) {
+	if s.diagnostics != nil {
+		s.diagnostics.Protect(request.Source.Host, request.Source.Username, request.Source.Password, request.Source.CredentialID, request.Destination.Host, request.Destination.Username, request.Destination.Password, request.Destination.CredentialID)
+		for _, mapping := range request.Mappings {
+			s.diagnostics.Protect(mapping.Source.Name, mapping.DestinationName)
+		}
+	}
 	if request.Options.Concurrency == 0 {
 		request.Options = domain.DefaultTransferOptions()
 	}
@@ -304,7 +331,22 @@ func (s *Service) Start(parent context.Context, request domain.StartRequest) (in
 	s.runs[id] = control
 	s.mu.Unlock()
 	go func() {
-		defer func() { s.mu.Lock(); delete(s.runs, id); s.mu.Unlock() }()
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				if s.diagnostics != nil {
+					s.diagnostics.RecordPanic("mail_run", id, string(domain.ServiceMail), recovered, debug.Stack())
+				}
+				message := "An internal error stopped the mail migration. Copy the diagnostics for support."
+				_ = s.db.AddServiceError(context.Background(), id, 0, domain.ServiceMail, "TB-MAIL-PANIC", message)
+				_ = s.db.MarkMigration(context.Background(), id, domain.MigrationFailed, message)
+				if s.events != nil {
+					s.events(domain.Progress{MigrationID: id, Service: domain.ServiceMail, State: domain.MigrationFailed, LastError: message, RunMode: request.Mode, RunPhase: "Internal error"})
+				}
+			}
+			s.mu.Lock()
+			delete(s.runs, id)
+			s.mu.Unlock()
+		}()
 		s.run(ctx, id, request, control)
 	}()
 	return id, nil
@@ -427,10 +469,20 @@ func (s *Service) run(ctx context.Context, id int64, request domain.StartRequest
 	jobs := make(chan database.FolderRecord)
 	duplicateIndexes := &duplicateIndexCache{indexes: make(map[string]*duplicateIndex)}
 	var wg sync.WaitGroup
+	var workerPanicked atomic.Bool
 	for worker := 0; worker < request.Options.Concurrency; worker++ {
 		wg.Add(1)
 		go func() {
-			defer wg.Done()
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					workerPanicked.Store(true)
+					if s.diagnostics != nil {
+						s.diagnostics.RecordPanic("mail_worker", id, string(domain.ServiceMail), recovered, debug.Stack())
+					}
+					control.cancel()
+				}
+				wg.Done()
+			}()
 			s.worker(ctx, id, request, control, jobs, duplicateIndexes, noticeMessageIDs, &copiedBytes, &copiedMessages, &failedMessages, &runItemsTotal, &runItemsDone, lastFailure, emit)
 		}()
 	}
@@ -447,6 +499,13 @@ dispatch:
 	}
 	close(jobs)
 	wg.Wait()
+	if workerPanicked.Load() {
+		message := "An internal error stopped the mail migration. Copy the diagnostics for support."
+		_ = s.db.AddServiceError(context.Background(), id, 0, domain.ServiceMail, "TB-MAIL-PANIC", message)
+		_ = s.db.MarkMigration(context.Background(), id, domain.MigrationFailed, message)
+		emit("", 0, domain.MigrationFailed, message)
+		return
+	}
 	if ctx.Err() != nil {
 		_ = s.db.RecoverMigrationMessages(context.Background(), id)
 		_ = s.db.MarkMigration(context.Background(), id, domain.MigrationCancelled, "cancelled by user")

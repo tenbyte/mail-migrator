@@ -1,6 +1,7 @@
 import type {
   AccountConfig, Conflict, DAVAccountSummary, DAVEndpoint, DAVServiceRequest, JobPreflightResult, Progress,
   FinalizeMailboxNoticesRequest, MailboxNoticeOverview, MailboxNoticeSettings, MailIssue, MailIssueResolution, RecentMigration, ResolveSourceDeletionsRequest, ResumeJobRequest, ResumeRequirements, ServiceKind, SourceDeletion, StartJobRequest, TransferOptions, UpdateInfo,
+  DiagnosticsInfo, FrontendErrorReport,
 } from './types'
 
 type Backend = {
@@ -35,6 +36,10 @@ type Backend = {
   DiscardSourceDeletionCredential(id: number): Promise<void>
   ResetMigrationData(): Promise<void>
   FactoryReset(): Promise<void>
+  DiagnosticsInfo(): Promise<DiagnosticsInfo>
+  ReportFrontendError(report: FrontendErrorReport): Promise<void>
+  CopyDiagnostics(): Promise<void>
+  OpenDiagnosticsDirectory(): Promise<void>
 }
 
 declare global {
@@ -84,6 +89,10 @@ export const backend = {
   discardSourceDeletionCredential: (id: number) => call(desktop => desktop.DiscardSourceDeletionCredential(id)),
   resetMigrationData: () => call(desktop => desktop.ResetMigrationData()),
   factoryReset: () => call(desktop => desktop.FactoryReset()),
+  diagnosticsInfo: () => call(desktop => desktop.DiagnosticsInfo()),
+  reportFrontendError: (report: FrontendErrorReport) => call(desktop => desktop.ReportFrontendError(report)),
+  copyDiagnostics: () => call(desktop => desktop.CopyDiagnostics()),
+  openDiagnosticsDirectory: () => call(desktop => desktop.OpenDiagnosticsDirectory()),
   onProgress: (callback: (progress: Progress) => void) => {
     try { return window.runtime?.EventsOn?.('job:progress', callback) ?? (() => undefined) }
     catch { return () => undefined }

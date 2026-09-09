@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	goruntime "runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -20,6 +21,7 @@ import (
 	"github.com/tenbyte/mail-migrator/internal/database"
 	"github.com/tenbyte/mail-migrator/internal/dav"
 	"github.com/tenbyte/mail-migrator/internal/davmigration"
+	"github.com/tenbyte/mail-migrator/internal/diagnostics"
 	"github.com/tenbyte/mail-migrator/internal/domain"
 	"github.com/tenbyte/mail-migrator/internal/folders"
 	"github.com/tenbyte/mail-migrator/internal/mailimap"
@@ -46,6 +48,9 @@ type App struct {
 	reloadApplication    func(context.Context)
 	resetBlocked         func() bool
 	removeStateFiles     func(string) error
+	diagnostics          *diagnostics.Manager
+	copyToClipboard      func(context.Context, string) error
+	openDiagnostics      func(string) error
 }
 
 type credentialStore interface {
@@ -58,8 +63,16 @@ type updateChecker interface {
 	Check(context.Context, string) (domain.UpdateInfo, error)
 }
 
-func NewApp() *App {
-	return &App{credentials: credentials.Store{}, deletionDestinations: make(map[int64]domain.AccountConfig), runProgress: make(map[int64]map[domain.ServiceKind]domain.Progress), updateChecker: updatecheck.New(), reloadApplication: runtime.WindowReloadApp, removeStateFiles: database.RemoveStateFiles}
+func NewApp(managers ...*diagnostics.Manager) *App {
+	var manager *diagnostics.Manager
+	if len(managers) > 0 {
+		manager = managers[0]
+	}
+	return &App{
+		credentials: credentials.Store{}, deletionDestinations: make(map[int64]domain.AccountConfig), runProgress: make(map[int64]map[domain.ServiceKind]domain.Progress),
+		updateChecker: updatecheck.New(), reloadApplication: runtime.WindowReloadApp, removeStateFiles: database.RemoveStateFiles,
+		diagnostics: manager, copyToClipboard: runtime.ClipboardSetText, openDiagnostics: openDirectory,
+	}
 }
 
 func (a *App) domReady(context.Context) { hideZoomButton() }
@@ -68,14 +81,27 @@ func (a *App) startup(ctx context.Context) {
 	a.lifecycleMu.Lock()
 	defer a.lifecycleMu.Unlock()
 	a.ctx = ctx
+	if a.diagnostics != nil {
+		a.diagnostics.InfoEvent("application_startup", diagnostics.Fields{})
+	}
 	path, err := database.DefaultPath()
 	if err != nil {
 		a.startupErr = err
+		if a.diagnostics != nil {
+			a.diagnostics.ErrorEvent("database_path_failed", diagnostics.Fields{ErrorCode: "TB-DIAG-DB-PATH", Message: err.Error()})
+		}
 		return
 	}
 	a.databasePath = path
 	if err := a.openDatabase(ctx, path); err != nil {
 		a.startupErr = err
+		if a.diagnostics != nil {
+			a.diagnostics.ErrorEvent("database_open_failed", diagnostics.Fields{ErrorCode: "TB-DIAG-DB-OPEN", Message: err.Error()})
+		}
+		return
+	}
+	if a.diagnostics != nil {
+		a.diagnostics.InfoEvent("application_ready", diagnostics.Fields{})
 	}
 }
 
@@ -89,14 +115,15 @@ func (a *App) openDatabase(ctx context.Context, path string) error {
 		return err
 	}
 	a.db = db
-	a.migrations = migration.New(db, mailimap.RealFactory{}, a.emitProgress)
-	a.davMigrations = davmigration.New(db, dav.RealFactory{}, a.emitProgress)
+	a.migrations = migration.New(db, mailimap.RealFactory{}, a.emitProgress, a.diagnostics)
+	a.davMigrations = davmigration.New(db, dav.RealFactory{}, a.emitProgress, a.diagnostics)
 	a.startupErr = nil
 	return nil
 }
 
 func (a *App) emitProgress(progress domain.Progress) {
 	a.progressMu.Lock()
+	previous := a.runProgress[progress.MigrationID][progress.Service]
 	if progress.Service != "" {
 		if a.runProgress[progress.MigrationID] == nil {
 			a.runProgress[progress.MigrationID] = make(map[domain.ServiceKind]domain.Progress)
@@ -108,6 +135,12 @@ func (a *App) emitProgress(progress domain.Progress) {
 		runSnapshot[kind] = item
 	}
 	a.progressMu.Unlock()
+	if a.diagnostics != nil && (previous.State != progress.State || previous.RunPhase != progress.RunPhase) {
+		a.diagnostics.InfoEvent("migration_progress", diagnostics.Fields{
+			MigrationID: progress.MigrationID, Service: string(progress.Service), Phase: progress.RunPhase, State: string(progress.State),
+			Values: map[string]any{"runItemsTotal": progress.RunItemsTotal, "runItemsDone": progress.RunItemsDone, "messagesFailed": progress.MessagesFailed},
+		})
+	}
 	if a.db != nil {
 		progress.Services, _ = a.db.ServiceProgresses(context.Background(), progress.MigrationID)
 		for index := range progress.Services {
@@ -172,6 +205,9 @@ func (a *App) shutdown(context.Context) {
 	}
 	a.migrations = nil
 	a.davMigrations = nil
+	if a.diagnostics != nil {
+		a.diagnostics.InfoEvent("application_shutdown", diagnostics.Fields{})
+	}
 }
 
 func (a *App) ensureReady() error {
@@ -269,6 +305,11 @@ func (a *App) FactoryReset() error {
 	if err := a.credentials.DeleteAll(); err != nil {
 		return fmt.Errorf("migration data was reset, but stored passwords could not be removed: %w", err)
 	}
+	if a.diagnostics != nil {
+		if err := a.diagnostics.Clear(); err != nil {
+			return fmt.Errorf("migration data and stored passwords were reset, but diagnostic logs could not be removed: %w", err)
+		}
+	}
 	if a.reloadApplication != nil {
 		a.reloadApplication(a.ctx)
 	}
@@ -276,6 +317,58 @@ func (a *App) FactoryReset() error {
 }
 
 func (a *App) Defaults() domain.TransferOptions { return domain.DefaultTransferOptions() }
+
+func (a *App) DiagnosticsInfo() domain.DiagnosticsInfo {
+	if a.diagnostics == nil {
+		return domain.DiagnosticsInfo{}
+	}
+	return domain.DiagnosticsInfo{LogDirectory: a.diagnostics.Directory(), ActiveLog: a.diagnostics.LogPath(), SessionID: a.diagnostics.SessionID()}
+}
+
+func (a *App) ReportFrontendError(report domain.FrontendErrorReport) error {
+	if strings.TrimSpace(report.Message) == "" {
+		return errors.New("frontend error message is required")
+	}
+	if len(report.Message)+len(report.Stack)+len(report.ComponentStack)+len(report.View) > 128<<10 {
+		return errors.New("frontend error report is too large")
+	}
+	if a.diagnostics == nil {
+		return errors.New("diagnostics are unavailable")
+	}
+	_, err := a.diagnostics.RecordFrontendError(diagnostics.FrontendError{
+		Message: report.Message, Stack: report.Stack, ComponentStack: report.ComponentStack, View: report.View, Fatal: report.Fatal,
+	})
+	return err
+}
+
+func (a *App) CopyDiagnostics() error {
+	if a.diagnostics == nil {
+		return errors.New("diagnostics are unavailable")
+	}
+	text, err := a.diagnostics.Snapshot(200)
+	if err != nil {
+		return err
+	}
+	copyText := a.copyToClipboard
+	if copyText == nil {
+		copyText = runtime.ClipboardSetText
+	}
+	if err := copyText(a.ctx, text); err != nil {
+		return fmt.Errorf("copy diagnostics to clipboard: %w", err)
+	}
+	return nil
+}
+
+func (a *App) OpenDiagnosticsDirectory() error {
+	if a.diagnostics == nil {
+		return errors.New("diagnostics are unavailable")
+	}
+	opener := a.openDiagnostics
+	if opener == nil {
+		opener = openDirectory
+	}
+	return opener(a.diagnostics.Directory())
+}
 
 func (a *App) MailboxNoticeSettings() (domain.MailboxNoticeSettings, error) {
 	if err := a.ensureReady(); err != nil {
@@ -329,10 +422,29 @@ func (a *App) OpenLatestRelease() {
 	runtime.BrowserOpenURL(a.ctx, updatecheck.LatestReleaseURL)
 }
 
+func (a *App) protectMailDiagnostics(accounts ...domain.AccountConfig) {
+	if a.diagnostics == nil {
+		return
+	}
+	for _, account := range accounts {
+		a.diagnostics.Protect(account.Host, account.Username, account.Password, account.CredentialID)
+	}
+}
+
+func (a *App) protectDAVDiagnostics(endpoints ...domain.DAVEndpoint) {
+	if a.diagnostics == nil {
+		return
+	}
+	for _, endpoint := range endpoints {
+		a.diagnostics.Protect(endpoint.URL, endpoint.Username, endpoint.Password, endpoint.CredentialID)
+	}
+}
+
 func (a *App) TestDAVAccount(kind domain.ServiceKind, endpoint domain.DAVEndpoint) (domain.DAVAccountSummary, error) {
 	if err := a.ensureReady(); err != nil {
 		return domain.DAVAccountSummary{}, err
 	}
+	a.protectDAVDiagnostics(endpoint)
 	ctx, cancel := context.WithTimeout(a.ctx, 5*time.Minute)
 	defer cancel()
 	return a.davMigrations.Inspect(ctx, kind, endpoint)
@@ -344,6 +456,11 @@ func (a *App) AnalyseJob(request domain.JobPreflightRequest) (domain.JobPrefligh
 	}
 	if !request.MailEnabled && !request.Calendar.Enabled && !request.Contacts.Enabled {
 		return domain.JobPreflightResult{}, errors.New("select at least mail, calendar, or contacts")
+	}
+	a.protectMailDiagnostics(request.MailSource, request.MailDestination)
+	a.protectDAVDiagnostics(request.Calendar.Source, request.Calendar.Destination, request.Contacts.Source, request.Contacts.Destination)
+	if a.diagnostics != nil {
+		a.diagnostics.InfoEvent("preflight_started", diagnostics.Fields{Values: map[string]any{"mail": request.MailEnabled, "calendar": request.Calendar.Enabled, "contacts": request.Contacts.Enabled}})
 	}
 	ctx, cancel := context.WithTimeout(a.ctx, 30*time.Minute)
 	defer cancel()
@@ -358,6 +475,14 @@ func (a *App) AnalyseJob(request domain.JobPreflightRequest) (domain.JobPrefligh
 	if request.MailEnabled {
 		count++
 		go func() {
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					if a.diagnostics != nil {
+						a.diagnostics.RecordPanic("job_mail_preflight", 0, string(domain.ServiceMail), recovered, debug.Stack())
+					}
+					results <- result{kind: domain.ServiceMail, err: errors.New("internal error during mail preflight")}
+				}
+			}()
 			value, err := a.migrations.Preflight(ctx, request.MailSource, request.MailDestination)
 			results <- result{kind: domain.ServiceMail, mail: value, err: err}
 		}()
@@ -369,6 +494,14 @@ func (a *App) AnalyseJob(request domain.JobPreflightRequest) (domain.JobPrefligh
 		count++
 		service := service
 		go func() {
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					if a.diagnostics != nil {
+						a.diagnostics.RecordPanic("job_dav_preflight", 0, string(service.Kind), recovered, debug.Stack())
+					}
+					results <- result{kind: service.Kind, err: errors.New("internal error during DAV preflight")}
+				}
+			}()
 			value, err := a.davMigrations.Preflight(ctx, service.Kind, service.Source, service.Destination)
 			results <- result{kind: service.Kind, dav: value, err: err}
 		}()
@@ -377,6 +510,9 @@ func (a *App) AnalyseJob(request domain.JobPreflightRequest) (domain.JobPrefligh
 	for range count {
 		item := <-results
 		if item.err != nil {
+			if a.diagnostics != nil {
+				a.diagnostics.ErrorEvent("preflight_failed", diagnostics.Fields{Service: string(item.kind), ErrorCode: "TB-DIAG-PREFLIGHT", Message: item.err.Error()})
+			}
 			return output, item.err
 		}
 		switch item.kind {
@@ -391,6 +527,9 @@ func (a *App) AnalyseJob(request domain.JobPreflightRequest) (domain.JobPrefligh
 			output.Warnings = append(output.Warnings, item.dav.Warnings...)
 		}
 	}
+	if a.diagnostics != nil {
+		a.diagnostics.InfoEvent("preflight_completed", diagnostics.Fields{Values: map[string]any{"serviceCount": count}})
+	}
 	return output, nil
 }
 
@@ -398,6 +537,7 @@ func (a *App) TestAccount(account domain.AccountConfig) (domain.ServerSummary, e
 	if err := a.ensureReady(); err != nil {
 		return domain.ServerSummary{}, err
 	}
+	a.protectMailDiagnostics(account)
 	ctx, cancel := context.WithTimeout(a.ctx, 3*time.Minute)
 	defer cancel()
 	return a.migrations.Inspect(ctx, account)
@@ -407,6 +547,7 @@ func (a *App) AnalyseMailboxes(source, destination domain.AccountConfig) (domain
 	if err := a.ensureReady(); err != nil {
 		return domain.PreflightResult{}, err
 	}
+	a.protectMailDiagnostics(source, destination)
 	ctx, cancel := context.WithTimeout(a.ctx, 15*time.Minute)
 	defer cancel()
 	return a.migrations.Preflight(ctx, source, destination)
@@ -415,6 +556,12 @@ func (a *App) AnalyseMailboxes(source, destination domain.AccountConfig) (domain
 func (a *App) StartMigration(request domain.StartRequest) (int64, error) {
 	if err := a.ensureReady(); err != nil {
 		return 0, err
+	}
+	a.protectMailDiagnostics(request.Source, request.Destination)
+	if a.diagnostics != nil {
+		for _, mapping := range request.Mappings {
+			a.diagnostics.Protect(mapping.Source.Name, mapping.DestinationName)
+		}
 	}
 	if err := a.prepareCredential("mail-source", &request.Source); err != nil {
 		return 0, err
@@ -438,6 +585,23 @@ func (a *App) StartJob(request domain.StartJobRequest) (int64, error) {
 	}
 	if !request.MailEnabled && !request.Calendar.Enabled && !request.Contacts.Enabled {
 		return 0, errors.New("select at least one service")
+	}
+	a.protectMailDiagnostics(request.MailSource, request.MailDestination)
+	a.protectDAVDiagnostics(request.Calendar.Source, request.Calendar.Destination, request.Contacts.Source, request.Contacts.Destination)
+	if a.diagnostics != nil {
+		for _, mapping := range request.MailMappings {
+			a.diagnostics.Protect(mapping.Source.Name, mapping.DestinationName)
+		}
+		for _, service := range []domain.DAVServiceRequest{request.Calendar, request.Contacts} {
+			for _, mapping := range service.Mappings {
+				a.diagnostics.Protect(mapping.Source.Name, mapping.Source.Path, mapping.DestinationName, mapping.DestinationPath)
+			}
+		}
+	}
+	if a.diagnostics != nil {
+		a.diagnostics.InfoEvent("job_start_requested", diagnostics.Fields{MigrationID: request.MigrationID, Phase: request.Mode, Values: map[string]any{
+			"mail": request.MailEnabled, "calendar": request.Calendar.Enabled, "contacts": request.Contacts.Enabled, "concurrency": request.Options.Concurrency,
+		}})
 	}
 	if err := validateMailboxNoticeSettings(&request.MailboxNotices); err != nil {
 		return 0, err
@@ -517,6 +681,9 @@ func (a *App) StartJob(request domain.StartJobRequest) (int64, error) {
 		started = append(started, service.Kind)
 	}
 	a.discardAllDeletionCredentials()
+	if a.diagnostics != nil {
+		a.diagnostics.InfoEvent("job_started", diagnostics.Fields{MigrationID: id, Phase: request.Mode, Values: map[string]any{"serviceCount": len(started)}})
+	}
 	return id, nil
 }
 
@@ -526,6 +693,9 @@ func (a *App) ResumeRequirements(migrationID int64) (domain.ResumeRequirements, 
 	}
 	if migrationID <= 0 {
 		return domain.ResumeRequirements{}, errors.New("invalid migration ID")
+	}
+	if a.diagnostics != nil {
+		a.diagnostics.InfoEvent("delta_requirements_requested", diagnostics.Fields{MigrationID: migrationID, Phase: "requirements"})
 	}
 	migration, err := a.db.RecentByID(a.ctx, migrationID)
 	if err != nil {
@@ -552,6 +722,11 @@ func (a *App) ResumeRequirements(migrationID int64) (domain.ResumeRequirements, 
 			output.Credentials = append(output.Credentials, domain.CredentialRequirement{Kind: kind, SourceAvailable: a.credentialAvailable(service.Source.CredentialID), DestinationAvailable: a.credentialAvailable(service.Destination.CredentialID)})
 		}
 	}
+	if a.diagnostics != nil {
+		a.diagnostics.InfoEvent("delta_requirements_completed", diagnostics.Fields{MigrationID: migrationID, Phase: "requirements", Values: map[string]any{
+			"serviceCount": len(services), "credentialRequirementCount": len(output.Credentials),
+		}})
+	}
 	return output, nil
 }
 
@@ -570,6 +745,9 @@ func (a *App) ResumeJob(input domain.ResumeJobRequest) (int64, error) {
 	if input.MigrationID <= 0 {
 		return 0, errors.New("invalid migration ID")
 	}
+	if a.diagnostics != nil {
+		a.diagnostics.InfoEvent("delta_start_requested", diagnostics.Fields{MigrationID: input.MigrationID, Phase: "credentials", Values: map[string]any{"credentialServiceCount": len(input.Credentials)}})
+	}
 	services, err := a.db.JobServices(a.ctx, input.MigrationID)
 	if err != nil {
 		return 0, err
@@ -584,17 +762,29 @@ func (a *App) ResumeJob(input domain.ResumeJobRequest) (int64, error) {
 			if err != nil {
 				return 0, err
 			}
+			a.protectMailDiagnostics(mailRequest.Source, mailRequest.Destination)
 			if err := a.resolveResumeAccount("mail-source", &mailRequest.Source, domain.AccountConfig{Password: credentials.SourcePassword, RememberCredential: input.RememberNewCredentials}); err != nil {
 				return 0, err
 			}
 			if err := a.resolveResumeAccount("mail-destination", &mailRequest.Destination, domain.AccountConfig{Password: credentials.DestinationPassword, RememberCredential: input.RememberNewCredentials}); err != nil {
 				return 0, err
 			}
+			if a.diagnostics != nil {
+				a.diagnostics.InfoEvent("delta_preflight_started", diagnostics.Fields{MigrationID: input.MigrationID, Service: string(kind), Phase: "preflight"})
+			}
 			ctx, cancel := context.WithTimeout(a.ctx, 30*time.Minute)
 			preflight, preflightErr := a.migrations.Preflight(ctx, mailRequest.Source, mailRequest.Destination)
 			cancel()
 			if preflightErr != nil {
+				if a.diagnostics != nil {
+					a.diagnostics.ErrorEvent("delta_preflight_failed", diagnostics.Fields{MigrationID: input.MigrationID, Service: string(kind), Phase: "preflight", ErrorCode: "TB-DIAG-DELTA-PREFLIGHT", Message: preflightErr.Error()})
+				}
 				return 0, fmt.Errorf("check mailboxes before the delta sync: %w", preflightErr)
+			}
+			if a.diagnostics != nil {
+				a.diagnostics.InfoEvent("delta_preflight_completed", diagnostics.Fields{MigrationID: input.MigrationID, Service: string(kind), Phase: "preflight", Values: map[string]any{
+					"sourceFolderCount": len(preflight.Source.Mailboxes), "destinationFolderCount": len(preflight.Destination.Mailboxes), "mappingCount": len(mailRequest.Mappings),
+				}})
 			}
 			a.excludeDeliveredSourceNotice(input.MigrationID, &preflight)
 			currentSource := make(map[string]domain.Mailbox, len(preflight.Source.Mailboxes))
@@ -621,6 +811,7 @@ func (a *App) ResumeJob(input domain.ResumeJobRequest) (int64, error) {
 			if err != nil {
 				return 0, err
 			}
+			a.protectDAVDiagnostics(service.Source, service.Destination)
 			if err := a.resolveDAVResumeEndpoint(string(kind)+"-source", &service.Source, domain.DAVEndpoint{Password: credentials.SourcePassword, RememberCredential: input.RememberNewCredentials}); err != nil {
 				return 0, err
 			}
@@ -636,12 +827,18 @@ func (a *App) ResumeJob(input domain.ResumeJobRequest) (int64, error) {
 	}
 	id, err := a.StartJob(request)
 	if err != nil {
+		if a.diagnostics != nil {
+			a.diagnostics.ErrorEvent("delta_start_failed", diagnostics.Fields{MigrationID: input.MigrationID, Phase: "start", ErrorCode: "TB-DIAG-DELTA-START", Message: err.Error()})
+		}
 		return 0, err
 	}
 	if deletionDestination != nil {
 		a.deletionMu.Lock()
 		a.deletionDestinations[input.MigrationID] = *deletionDestination
 		a.deletionMu.Unlock()
+	}
+	if a.diagnostics != nil {
+		a.diagnostics.InfoEvent("delta_started", diagnostics.Fields{MigrationID: id, Phase: "reconcile", Values: map[string]any{"serviceCount": len(services)}})
 	}
 	return id, nil
 }
@@ -874,6 +1071,7 @@ func (a *App) FinalizeMailboxNotices(input domain.FinalizeMailboxNoticesRequest)
 	if err != nil {
 		return overview, err
 	}
+	a.protectMailDiagnostics(request.Source, request.Destination)
 	remember := input.RememberNewCredentials
 	if hasPendingSource {
 		if err := a.resolveResumeAccount("mail-source", &request.Source, domain.AccountConfig{Password: input.SourcePassword, RememberCredential: remember}); err != nil {
@@ -1095,14 +1293,19 @@ func (a *App) ExportSupportBundle(id int64) (string, error) {
 		return "", err
 	}
 	conflicts, _ := a.db.Conflicts(a.ctx, id)
+	diagnosticSnapshot := ""
+	if a.diagnostics != nil {
+		diagnosticSnapshot, _ = a.diagnostics.Snapshot(200)
+	}
 	bundle := struct {
-		Version   string            `json:"version"`
-		OS        string            `json:"os"`
-		Arch      string            `json:"arch"`
-		CreatedAt time.Time         `json:"createdAt"`
-		Report    domain.Report     `json:"report"`
-		Conflicts []domain.Conflict `json:"conflicts"`
-	}{Version: appVersion, OS: goruntime.GOOS, Arch: goruntime.GOARCH, CreatedAt: time.Now().UTC(), Report: report, Conflicts: conflicts}
+		Version     string            `json:"version"`
+		OS          string            `json:"os"`
+		Arch        string            `json:"arch"`
+		CreatedAt   time.Time         `json:"createdAt"`
+		Report      domain.Report     `json:"report"`
+		Conflicts   []domain.Conflict `json:"conflicts"`
+		Diagnostics string            `json:"diagnostics,omitempty"`
+	}{Version: appVersion, OS: goruntime.GOOS, Arch: goruntime.GOARCH, CreatedAt: time.Now().UTC(), Report: report, Conflicts: conflicts, Diagnostics: diagnosticSnapshot}
 	data, err := json.MarshalIndent(bundle, "", "  ")
 	if err != nil {
 		return "", err

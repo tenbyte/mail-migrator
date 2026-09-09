@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/tenbyte/mail-migrator/internal/diagnostics"
 	"github.com/tenbyte/mail-migrator/internal/domain"
 )
 
@@ -241,6 +242,66 @@ func TestFactoryResetClearsCredentialsAndReloads(t *testing.T) {
 	}
 }
 
+func TestDiagnosticsBindingsPersistSanitizeAndCopyFrontendCrash(t *testing.T) {
+	manager, err := diagnostics.NewWithConfig(diagnostics.Config{Directory: t.TempDir(), Version: "test", Debug: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Close() })
+	app := NewApp(manager)
+	app.ctx = context.Background()
+	var copied string
+	app.copyToClipboard = func(_ context.Context, value string) error { copied = value; return nil }
+
+	if err := app.ReportFrontendError(domain.FrontendErrorReport{}); err == nil {
+		t.Fatal("empty frontend error was accepted")
+	}
+	if err := app.ReportFrontendError(domain.FrontendErrorReport{Message: strings.Repeat("x", 129<<10)}); err == nil {
+		t.Fatal("oversized frontend error was accepted")
+	}
+	report := domain.FrontendErrorReport{
+		Message: "Cannot read properties of null password=hunter2 user@example.com\n", Stack: "/Users/alice/project/App.tsx:1", ComponentStack: "at ResumeDialog\x1b[31m", View: "transfer", Fatal: true,
+	}
+	if err := app.ReportFrontendError(report); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.CopyDiagnostics(); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(copied, "Cannot read properties of null") || !strings.Contains(copied, "LATEST CRASH") {
+		t.Fatalf("copied diagnostics missing crash: %s", copied)
+	}
+	for _, private := range []string{"hunter2", "user@example.com", "/Users/alice"} {
+		if strings.Contains(copied, private) {
+			t.Fatalf("copied diagnostics leaked %q: %s", private, copied)
+		}
+	}
+	info := app.DiagnosticsInfo()
+	if info.LogDirectory != manager.Directory() || info.ActiveLog != manager.LogPath() || info.SessionID == "" {
+		t.Fatalf("unexpected diagnostics info: %#v", info)
+	}
+}
+
+func TestFactoryResetClearsDiagnosticCrashFiles(t *testing.T) {
+	directory := t.TempDir()
+	manager, err := diagnostics.NewWithConfig(diagnostics.Config{Directory: filepath.Join(directory, "logs"), Version: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Close() })
+	_, _ = manager.RecordFrontendError(diagnostics.FrontendError{Message: "boom", Fatal: true})
+	app := newResetTestApp(t, filepath.Join(directory, "migrations.db"), &memoryCredentialStore{})
+	app.diagnostics = manager
+	app.reloadApplication = nil
+	if err := app.FactoryReset(); err != nil {
+		t.Fatal(err)
+	}
+	crashes, _ := filepath.Glob(filepath.Join(manager.Directory(), "crash-*.log"))
+	if len(crashes) != 0 {
+		t.Fatalf("factory reset retained crash reports: %v", crashes)
+	}
+}
+
 func TestFactoryResetReportsCredentialFailureAfterDataReset(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "migrations.db")
 	store := &memoryCredentialStore{deleteAllErr: errors.New("keyring locked")}
@@ -355,8 +416,8 @@ func TestApplicationVersionsAreConsistent(t *testing.T) {
 		"frontend/package-lock.json":      lockfile["version"],
 		"frontend/package-lock.json root": lockRoot["version"],
 	} {
-		if version != "0.4.0" {
-			t.Errorf("%s has version %v, want 0.4.0", path, version)
+		if version != "0.5.0" {
+			t.Errorf("%s has version %v, want 0.5.0", path, version)
 		}
 	}
 }

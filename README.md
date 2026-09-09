@@ -29,7 +29,7 @@ CalDAV and CardDAV appear only after a session-only opt-in under Advanced settin
 - Exports migration reports and privacy-conscious support bundles on demand.
 - Provides separate migration-data and full factory resets under Advanced settings.
 
-Version 0.4.0 supports macOS 13 or later and Windows 10 or later. The project uses Go 1.27, Node.js 22, React, and Wails 2.15.
+Version 0.5.0 supports macOS 13 or later and Windows 10 or later. The project uses Go 1.27, Node.js 22, React, and Wails 2.15.
 
 Mailbox notices are disabled by default. Configure them on the separate **Mailbox notices** page linked from Advanced settings. Every new migration stores an immutable copy of the current settings. After the migration completes, **Finalize mailbox notices** appends the enabled English plaintext/HTML messages; retrying is idempotent and a later delta sync excludes the generated source notice.
 
@@ -45,6 +45,7 @@ Install Go 1.27 and Node.js 22. macOS builds require Xcode Command Line Tools. W
 
 ```bash
 make frontend
+make dev-debug
 make test
 make test-race
 make lint
@@ -54,9 +55,9 @@ make build-macos
 make build-windows
 ```
 
-`make dev` starts the Wails development environment. Desktop binaries are written to `build/bin`. CycloneDX SBOM files are generated under `build/compliance` and are not committed.
+`make dev` starts the Wails development environment; `make dev-debug` adds detailed privacy-conscious diagnostics for reproducing failures. Desktop binaries are written to `build/bin`. CycloneDX SBOM files are generated under `build/compliance` and are not committed.
 
-Pushing a matching version tag such as `v0.4.0` runs the release workflow. It builds a Windows executable and a universal macOS app, packages them with SHA-256 checksums, and publishes the files on the corresponding GitHub release. Generated binaries and release packages remain ignored by Git.
+Pushing a matching version tag such as `v0.5.0` runs the release workflow. It builds a Windows executable and a universal macOS app, packages them with SHA-256 checksums, and publishes the files on the corresponding GitHub release. Generated binaries and release packages remain ignored by Git.
 
 ## Security and local data
 

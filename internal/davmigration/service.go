@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"path"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/tenbyte/mail-migrator/internal/database"
 	"github.com/tenbyte/mail-migrator/internal/dav"
+	"github.com/tenbyte/mail-migrator/internal/diagnostics"
 	"github.com/tenbyte/mail-migrator/internal/domain"
 	"github.com/tenbyte/mail-migrator/internal/retry"
 	"github.com/tenbyte/mail-migrator/internal/security"
@@ -25,11 +27,12 @@ import (
 type EventSink func(domain.Progress)
 
 type Service struct {
-	db      *database.DB
-	factory dav.Factory
-	events  EventSink
-	mu      sync.Mutex
-	runs    map[string]*runControl
+	db          *database.DB
+	factory     dav.Factory
+	events      EventSink
+	diagnostics *diagnostics.Manager
+	mu          sync.Mutex
+	runs        map[string]*runControl
 }
 
 type runControl struct {
@@ -38,8 +41,12 @@ type runControl struct {
 	notify chan struct{}
 }
 
-func New(db *database.DB, factory dav.Factory, events EventSink) *Service {
-	return &Service{db: db, factory: factory, events: events, runs: make(map[string]*runControl)}
+func New(db *database.DB, factory dav.Factory, events EventSink, managers ...*diagnostics.Manager) *Service {
+	var manager *diagnostics.Manager
+	if len(managers) > 0 {
+		manager = managers[0]
+	}
+	return &Service{db: db, factory: factory, events: events, diagnostics: manager, runs: make(map[string]*runControl)}
 }
 
 func (s *Service) Active() bool {
@@ -57,6 +64,9 @@ func (s *Service) Inspect(ctx context.Context, kind domain.ServiceKind, endpoint
 }
 
 func (s *Service) Preflight(ctx context.Context, kind domain.ServiceKind, source, destination domain.DAVEndpoint) (domain.DAVPreflightResult, error) {
+	if s.diagnostics != nil {
+		s.diagnostics.Protect(source.URL, source.Username, source.Password, source.CredentialID, destination.URL, destination.Username, destination.Password, destination.CredentialID)
+	}
 	type result struct {
 		source  bool
 		client  dav.Client
@@ -73,8 +83,19 @@ func (s *Service) Preflight(ctx context.Context, kind domain.ServiceKind, source
 		summary, err := client.Summary(ctx)
 		results <- result{source: sourceSide, client: client, summary: summary, err: err}
 	}
-	go connect(source, true)
-	go connect(destination, false)
+	runConnect := func(endpoint domain.DAVEndpoint, sourceSide bool) {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				if s.diagnostics != nil {
+					s.diagnostics.RecordPanic("dav_preflight", 0, string(kind), recovered, debug.Stack())
+				}
+				results <- result{source: sourceSide, err: errors.New("internal error during DAV preflight")}
+			}
+		}()
+		connect(endpoint, sourceSide)
+	}
+	go runConnect(source, true)
+	go runConnect(destination, false)
 	first, second := <-results, <-results
 	if first.err != nil {
 		return domain.DAVPreflightResult{}, first.err
@@ -198,6 +219,12 @@ func recommendMappings(source, destination []domain.DAVCollection) []domain.Coll
 }
 
 func (s *Service) Start(parent context.Context, migrationID int64, request domain.DAVServiceRequest, options domain.TransferOptions, mode string) error {
+	if s.diagnostics != nil {
+		s.diagnostics.Protect(request.Source.URL, request.Source.Username, request.Source.Password, request.Source.CredentialID, request.Destination.URL, request.Destination.Username, request.Destination.Password, request.Destination.CredentialID)
+		for _, mapping := range request.Mappings {
+			s.diagnostics.Protect(mapping.Source.Name, mapping.Source.Path, mapping.DestinationName, mapping.DestinationPath)
+		}
+	}
 	if migrationID <= 0 || !request.Enabled {
 		return errors.New("invalid DAV migration request")
 	}
@@ -217,6 +244,16 @@ func (s *Service) Start(parent context.Context, migrationID int64, request domai
 	s.mu.Unlock()
 	go func() {
 		defer func() {
+			if recovered := recover(); recovered != nil {
+				if s.diagnostics != nil {
+					s.diagnostics.RecordPanic("dav_run", migrationID, string(request.Kind), recovered, debug.Stack())
+				}
+				message := "An internal error stopped the DAV migration. Copy the diagnostics for support."
+				_ = s.db.MarkService(context.Background(), migrationID, request.Kind, domain.MigrationFailed, message)
+				if s.events != nil {
+					s.events(domain.Progress{MigrationID: migrationID, Service: request.Kind, State: domain.MigrationFailed, LastError: message, RunMode: mode, RunPhase: "Internal error"})
+				}
+			}
 			s.mu.Lock()
 			delete(s.runs, key)
 			s.mu.Unlock()

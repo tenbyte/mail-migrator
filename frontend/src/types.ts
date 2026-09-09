@@ -134,3 +134,17 @@ export interface ResumeJobRequest {
   credentials: Partial<Record<ServiceKind, ResumeCredentialInput>>
   rememberNewCredentials: boolean
 }
+
+export interface FrontendErrorReport {
+  message: string
+  stack?: string
+  componentStack?: string
+  view?: string
+  fatal: boolean
+}
+
+export interface DiagnosticsInfo {
+  logDirectory: string
+  activeLog: string
+  sessionId: string
+}

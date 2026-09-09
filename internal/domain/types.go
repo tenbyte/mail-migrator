@@ -330,6 +330,20 @@ type ResumeJobRequest struct {
 	RememberNewCredentials bool                                  `json:"rememberNewCredentials"`
 }
 
+type FrontendErrorReport struct {
+	Message        string `json:"message"`
+	Stack          string `json:"stack,omitempty"`
+	ComponentStack string `json:"componentStack,omitempty"`
+	View           string `json:"view,omitempty"`
+	Fatal          bool   `json:"fatal"`
+}
+
+type DiagnosticsInfo struct {
+	LogDirectory string `json:"logDirectory"`
+	ActiveLog    string `json:"activeLog"`
+	SessionID    string `json:"sessionId"`
+}
+
 type MailIssueResolution string
 
 const (

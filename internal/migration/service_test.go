@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/tenbyte/mail-migrator/internal/database"
+	"github.com/tenbyte/mail-migrator/internal/diagnostics"
 	"github.com/tenbyte/mail-migrator/internal/domain"
 	"github.com/tenbyte/mail-migrator/internal/mailimap"
 )
@@ -101,6 +102,45 @@ type staticFactory struct{ client mailimap.Client }
 
 func (f staticFactory) Connect(context.Context, domain.AccountConfig, time.Duration, time.Duration) (mailimap.Client, error) {
 	return f.client, nil
+}
+
+type panicFactory struct{}
+
+func (panicFactory) Connect(context.Context, domain.AccountConfig, time.Duration, time.Duration) (mailimap.Client, error) {
+	panic("test panic")
+}
+
+func TestStartRecoversPanicAndMarksMigrationFailed(t *testing.T) {
+	db, err := database.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	manager, err := diagnostics.NewWithConfig(diagnostics.Config{Directory: t.TempDir(), Version: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+	service := New(db, panicFactory{}, nil, manager)
+	id, err := service.Start(context.Background(), domain.StartRequest{Source: domain.AccountConfig{Host: "source"}, Destination: domain.AccountConfig{Host: "destination"}, Options: domain.DefaultTransferOptions()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		migration, readErr := db.RecentByID(context.Background(), id)
+		if readErr == nil && migration.State == domain.MigrationFailed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("migration was not marked failed after panic: %#v, %v", migration, readErr)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	crashes, _ := filepath.Glob(filepath.Join(manager.Directory(), "crash-*.log"))
+	if len(crashes) != 1 {
+		t.Fatalf("panic did not create exactly one crash report: %v", crashes)
+	}
 }
 
 type noticeClient struct {

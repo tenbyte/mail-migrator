@@ -20,5 +20,8 @@ static void TenbyteHideZoomButton(void) {
 }
 */
 import "C"
+import "os/exec"
 
 func hideZoomButton() { C.TenbyteHideZoomButton() }
+
+func openDirectory(path string) error { return exec.Command("open", path).Start() }

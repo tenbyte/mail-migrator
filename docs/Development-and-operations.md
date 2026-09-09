@@ -15,6 +15,7 @@
 
 ```bash
 make dev
+make dev-debug
 make frontend
 make test
 make test-race
@@ -24,6 +25,16 @@ make sbom
 make build-macos
 make build-windows
 ```
+
+`make dev-debug` enables detailed application diagnostics and Wails debug logging without recording account names, server names, folder names, subjects, or message content. On Windows, the equivalent PowerShell command is:
+
+```powershell
+$env:TENBYTE_LOG_LEVEL = "debug"
+$env:GOTOOLCHAIN = "go1.27.0"
+go run github.com/wailsapp/wails/v2/cmd/wails@v2.15.0 dev -devserver localhost:34116 -loglevel Debug -v 2 -nocolour
+```
+
+Diagnostic files are stored under `~/Library/Application Support/Tenbyte Mail Migrator/logs` on macOS and `%LOCALAPPDATA%\Tenbyte\Mail Migrator\logs` on Windows. Press `F12` in a Windows development build to open the WebView developer tools. The application also exposes **Copy diagnostics** and **Open log folder** under Advanced settings; a frontend crash shows the copy action directly in its fallback screen.
 
 `npm ci` is used for reproducible frontend installs. The frontend is built before root Go tests because the compiled assets are embedded by `main.go`. Vulnerability scanning is limited to the root package and `internal/...`; it does not traverse `frontend/node_modules` as Go source.
 

@@ -20,6 +20,14 @@ The database contains server names, account usernames, folder and collection map
 
 Before a schema upgrade, the application creates a one-time backup beside the database using the form `migrations.db.vN.bak`. WAL and shared-memory files may exist while the application is running.
 
+## Diagnostic logs
+
+The application keeps a small local diagnostic log so failures that prevent the interface from rendering can still be investigated. Logs are stored below the application data directory in `logs`: `~/Library/Application Support/Tenbyte Mail Migrator/logs` on macOS and `%LOCALAPPDATA%\Tenbyte\Mail Migrator\logs` on Windows.
+
+The log contains the application version, operating system, session and migration IDs, enabled service kinds, operation phases, counters, states, error codes, and sanitized technical errors. It intentionally excludes passwords, credentials, server names, usernames, email addresses, folder names, message subjects, and message bodies. The active log rotates at 2 MiB and at most four older logs are retained. At most ten separate frontend or Go panic reports are retained. An unclean-shutdown marker records that a previous session did not stop normally, but cannot guarantee a final stacktrace after an operating-system or hardware failure.
+
+**Copy diagnostics** copies the latest crash report and no more than the last 200 log entries. Support bundles include the same bounded diagnostic excerpt. Diagnostic files remain after **Reset migration data** so that reset-related failures can be investigated; **Reset entire app** removes existing logs and crash reports before starting a fresh log.
+
 ## Credentials
 
 Passwords are held in process memory for the active operation. If the user selects credential storage, the password is stored through the operating system credential store under service name `com.tenbyte.mail-migrator`. SQLite keeps only the credential reference.
@@ -31,7 +39,7 @@ Closing the application clears session-only destination credentials and DAV Alph
 Advanced settings provides two explicit, confirmed reset operations:
 
 - **Reset migration data** removes migration history, progress, mappings, delta-sync state, conflicts, warnings, and recovery records. Saved passwords, the current connection form, and global mailbox-notice settings remain available.
-- **Reset entire app** removes the same migration data, global mailbox-notice settings, and every password stored by this application in the operating system credential store. The application reloads into its first-run state after a successful reset.
+- **Reset entire app** removes the same migration data, global mailbox-notice settings, diagnostic logs, crash reports, and every password stored by this application in the operating system credential store. The application reloads into its first-run state after a successful reset.
 
 Both operations close SQLite before removing `migrations.db`, its `-wal` and `-shm` sidecars, and schema backups matching `migrations.db.vN.bak`. A fresh database with the current schema is created immediately. Resets are rejected while a transfer is active.
 
@@ -59,7 +67,7 @@ The GitHub request has a five-second timeout, uses no token, and includes only a
 
 ## Reports and support bundles
 
-Exports are written only after the user selects a destination. Reports and support bundles can contain server names, account identifiers, folder or collection names, message metadata, mailbox-notice custom text, errors, and migration timing. They do not contain passwords or raw migrated message bodies. Review exports before sharing them.
+Exports are written only after the user selects a destination. Reports and support bundles can contain server names, account identifiers, folder or collection names, message metadata, mailbox-notice custom text, errors, migration timing, and the bounded sanitized diagnostic excerpt described above. They do not contain passwords or raw migrated message bodies. Review exports before sharing them.
 
 ## Recovery
 
