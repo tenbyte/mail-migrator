@@ -18,7 +18,7 @@ import (
 //go:embed all:frontend/dist
 var assets embed.FS
 
-const appVersion = "0.5.0"
+const appVersion = "0.6.0"
 
 func main() {
 	diagnosticManager, diagnosticErr := diagnostics.New(appVersion)

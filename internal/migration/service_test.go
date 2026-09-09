@@ -30,6 +30,7 @@ type reconciliationClient struct {
 	raw           map[uint32][]byte
 	summaries     map[uint32]mailimap.MessageSummary
 	keywords      map[string][]mailimap.KeywordCount
+	literalSizes  map[uint32]int64
 	uidValidity   uint32
 }
 
@@ -78,7 +79,13 @@ func (c *reconciliationClient) StreamMessage(_ context.Context, uid uint32, cons
 	if !ok {
 		return errors.New("message body not returned")
 	}
-	return consume(bytes.NewReader(raw), int64(len(raw)))
+	size := int64(len(raw))
+	if c.literalSizes != nil {
+		if literalSize, ok := c.literalSizes[uid]; ok {
+			size = literalSize
+		}
+	}
+	return consume(bytes.NewReader(raw), size)
 }
 func (c *reconciliationClient) AppendMessage(context.Context, string, mailimap.MessageMetadata, io.Reader, []string, []string) (mailimap.AppendResult, error) {
 	return mailimap.AppendResult{}, nil
@@ -310,16 +317,24 @@ func TestUIDsAfter(t *testing.T) {
 	}
 }
 
-func TestHashSelectedMessageQuarantinesEmptyAndSizeMismatch(t *testing.T) {
-	client := &reconciliationClient{raw: map[uint32][]byte{1: {}, 2: []byte("abc")}}
+func TestHashSelectedMessageQuarantinesEmptyAndTruncatedLiteral(t *testing.T) {
+	client := &reconciliationClient{
+		raw:          map[uint32][]byte{1: {}, 2: []byte("abc"), 3: []byte("abc")},
+		literalSizes: map[uint32]int64{3: 4},
+	}
 	_, _, err := hashSelectedMessage(context.Background(), client, 1, 0, false)
 	var mailIssue *mailIssueError
 	if !errors.As(err, &mailIssue) || mailIssue.code != "TB-MAIL-SOURCE-EMPTY" || mailIssue.state != domain.MessageQuarantined {
 		t.Fatalf("empty source was not quarantined: %v", err)
 	}
-	_, _, err = hashSelectedMessage(context.Background(), client, 2, 4, true)
+	_, _, err = hashSelectedMessage(context.Background(), client, 3, 3, true)
 	if !errors.As(err, &mailIssue) || mailIssue.code != "TB-MAIL-SOURCE-SIZE-MISMATCH" {
-		t.Fatalf("size mismatch was not quarantined: %v", err)
+		t.Fatalf("truncated literal was not quarantined: %v", err)
+	}
+
+	digest, size, err := hashSelectedMessage(context.Background(), client, 2, 4, true)
+	if err != nil || size != 3 || digest == "" {
+		t.Fatalf("RFC822.SIZE mismatch was incorrectly rejected: digest=%q size=%d err=%v", digest, size, err)
 	}
 }
 
@@ -380,7 +395,7 @@ func TestExactDuplicateIndexPreservesMultiplicityWithoutMessageID(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	meta := mailimap.MessageMetadata{Size: int64(len(raw)), SizeKnown: true}
+	meta := mailimap.MessageMetadata{Size: int64(len(raw)) - 1, SizeKnown: true}
 	first, _, _, found, err := index.findExact(context.Background(), source, destination, 1, meta)
 	if err != nil || !found || first != 101 {
 		t.Fatalf("first match uid=%d found=%v err=%v", first, found, err)

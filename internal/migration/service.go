@@ -615,9 +615,6 @@ func hashSelectedMessage(ctx context.Context, client mailimap.Client, uid uint32
 		if size == 0 && !sizeKnown {
 			return issue(domain.MessageQuarantined, "TB-MAIL-SOURCE-EMPTY", "The source returned an empty message.")
 		}
-		if sizeKnown && size != expectedSize {
-			return issue(domain.MessageQuarantined, "TB-MAIL-SOURCE-SIZE-MISMATCH", fmt.Sprintf("Literal size %d does not match RFC822.SIZE %d.", size, expectedSize))
-		}
 		hash := sha256.New()
 		written, err := io.CopyBuffer(hash, reader, make([]byte, 64*1024))
 		if err != nil {
@@ -759,26 +756,21 @@ func (index *duplicateIndex) addConsumed(uid uint32, size int64, digest string) 
 }
 
 func (index *duplicateIndex) findExact(ctx context.Context, source, destination mailimap.Client, sourceUID uint32, metadata mailimap.MessageMetadata) (uint32, string, int64, bool, error) {
-	if index == nil || !metadata.SizeKnown {
+	if index == nil {
 		return 0, "", metadata.Size, false, nil
 	}
-	index.mu.Lock()
-	defer index.mu.Unlock()
-	candidates := index.bySize[metadata.Size]
-	available := false
-	for _, candidate := range candidates {
-		if !candidate.used {
-			available = true
-			break
-		}
-	}
-	if !available {
-		return 0, "", metadata.Size, false, nil
-	}
-	sourceSHA, sourceSize, err := hashSelectedMessage(ctx, source, sourceUID, metadata.Size, true)
+
+	// RFC822.SIZE is only a hint on some legacy IMAP servers. Read the source
+	// literal first so the duplicate lookup uses the bytes that would actually
+	// be transferred.
+	sourceSHA, sourceSize, err := hashSelectedMessage(ctx, source, sourceUID, metadata.Size, metadata.SizeKnown)
 	if err != nil {
 		return 0, "", sourceSize, false, err
 	}
+
+	index.mu.Lock()
+	defer index.mu.Unlock()
+	candidates := index.bySize[sourceSize]
 	for _, candidate := range candidates {
 		if candidate.used {
 			continue
@@ -1040,19 +1032,6 @@ func (s *Service) worker(ctx context.Context, id int64, request domain.StartRequ
 				}
 				continue
 			}
-			if limits.AppendLimit > 0 && meta.SizeKnown && meta.Size > limits.AppendLimit {
-				message := fmt.Sprintf("The message is %d bytes, which exceeds the APPENDLIMIT of %d bytes.", meta.Size, limits.AppendLimit)
-				_ = s.db.FailMessageCode(ctx, id, folder.ID, uid, domain.MessageQuarantined, "TB-MAIL-TARGET-APPEND-LIMIT", message)
-				failedMessages.Add(1)
-				continue
-			}
-			if limits.QuotaAvailableBytes > 0 && meta.SizeKnown && meta.Size > limits.QuotaAvailableBytes {
-				message := "The free storage reported by the destination is insufficient for this message."
-				_ = s.db.FailMessageCode(ctx, id, folder.ID, uid, domain.MessageFailed, "TB-MAIL-TARGET-QUOTA", message)
-				failedMessages.Add(1)
-				emit(folder.SourceName, uid, domain.MigrationRunning, "[TB-MAIL-TARGET-QUOTA] "+message)
-				return
-			}
 			if request.Options.DuplicateProtection {
 				candidateUID, sourceSHA, sourceSize, found, duplicateErr := duplicates.findExact(ctx, src, dst, uid, meta)
 				if duplicateErr != nil {
@@ -1080,6 +1059,8 @@ func (s *Service) worker(ctx context.Context, id int64, request domain.StartRequ
 			var sha string
 			var transferErr error
 			transferredSize := meta.Size
+			sourceSizeMismatch := false
+			warningRecorded := false
 			appendMeta := meta
 			if !request.Options.PreserveFlags {
 				appendMeta.Flags = nil
@@ -1139,10 +1120,17 @@ func (s *Service) worker(ctx context.Context, id int64, request domain.StartRequ
 						return issue(domain.MessageQuarantined, "TB-MAIL-SOURCE-EMPTY", "The source raw body is empty.")
 					}
 					if meta.SizeKnown && size != meta.Size {
-						return issue(domain.MessageQuarantined, "TB-MAIL-SOURCE-SIZE-MISMATCH", fmt.Sprintf("Literal size %d does not match RFC822.SIZE %d.", size, meta.Size))
+						sourceSizeMismatch = true
+						if !warningRecorded {
+							warningRecorded = true
+							_ = s.db.AddMessageWarning(ctx, id, folder.ID, uid, "TB-MAIL-SOURCE-RFC822-SIZE-MISMATCH", fmt.Sprintf("Source reported RFC822.SIZE %d but returned %d raw bytes; the raw literal size was used for transfer.", meta.Size, size))
+						}
 					}
 					if limits.AppendLimit > 0 && size > limits.AppendLimit {
 						return issue(domain.MessageQuarantined, "TB-MAIL-TARGET-APPEND-LIMIT", fmt.Sprintf("The message is %d bytes, which exceeds the APPENDLIMIT of %d bytes.", size, limits.AppendLimit))
+					}
+					if limits.QuotaAvailableBytes > 0 && size > limits.QuotaAvailableBytes {
+						return issue(domain.MessageFailed, "TB-MAIL-TARGET-QUOTA", "The free storage reported by the destination is insufficient for this message.")
 					}
 					appendMeta.Size = size
 					hash := sha256.New()
@@ -1201,7 +1189,7 @@ func (s *Service) worker(ctx context.Context, id int64, request domain.StartRequ
 				}
 				if transferErr == nil {
 					_ = s.db.MarkMessageVerifying(ctx, id, folder.ID, uid, appendResult.UID, sha)
-					fullHash := request.Options.VerificationMode != domain.VerificationMetadata
+					fullHash := request.Options.VerificationMode != domain.VerificationMetadata || sourceSizeMismatch
 					destinationSHA, verifyErr := verifyDestinationMessage(ctx, dst, appendResult.UID, actualSize, sha, fullHash)
 					if verifyErr != nil {
 						transferErr = verifyErr

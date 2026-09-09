@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.0 - 2026-09-09
+
+### Fixed
+
+- Legacy IMAP servers whose `RFC822.SIZE` differs from the `BODY[]` literal can now transfer messages safely using the literal size. The mismatch is recorded as a warning, while the migrated message is verified with SHA-256.
+- APPENDLIMIT, quota checks, and duplicate protection now use the actual raw literal size instead of potentially incorrect source metadata.
+- Incomplete raw literals continue to be quarantined.
+
 ## 0.4.0 - 2026-09-08
 
 ### Added
