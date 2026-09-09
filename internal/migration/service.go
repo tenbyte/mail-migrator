@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"runtime/debug"
 	"sort"
@@ -607,59 +608,127 @@ func issue(state domain.MessageState, code, text string) error {
 	return &mailIssueError{state: state, code: code, text: text}
 }
 
-func hashSelectedMessage(ctx context.Context, client mailimap.Client, uid uint32, expectedSize int64, sizeKnown bool) (string, int64, error) {
-	var digest string
-	var literalSize int64
+type messageDigests struct {
+	exact     string
+	canonical string
+	size      int64
+}
+
+// canonicalLineEndingHasher makes verification tolerant only to CRLF/LF
+// storage normalization. IMAP servers are expected to preserve a message, but
+// some legacy stores count or return the same message with different newline
+// conventions after APPEND.
+type canonicalLineEndingHasher struct {
+	hash      hash.Hash
+	pendingCR bool
+}
+
+func newCanonicalLineEndingHasher() *canonicalLineEndingHasher {
+	return &canonicalLineEndingHasher{hash: sha256.New()}
+}
+
+func (writer *canonicalLineEndingHasher) Write(data []byte) (int, error) {
+	canonical := make([]byte, 0, len(data)+1)
+	for _, value := range data {
+		if writer.pendingCR {
+			if value == '\n' {
+				canonical = append(canonical, '\n')
+				writer.pendingCR = false
+				continue
+			}
+			canonical = append(canonical, '\r')
+			writer.pendingCR = false
+		}
+		if value == '\r' {
+			writer.pendingCR = true
+		} else {
+			canonical = append(canonical, value)
+		}
+	}
+	_, err := writer.hash.Write(canonical)
+	return len(data), err
+}
+
+func (writer *canonicalLineEndingHasher) sum() string {
+	if writer.pendingCR {
+		_, _ = writer.hash.Write([]byte{'\r'})
+		writer.pendingCR = false
+	}
+	return hex.EncodeToString(writer.hash.Sum(nil))
+}
+
+func hashSelectedMessageDigests(ctx context.Context, client mailimap.Client, uid uint32, sizeKnown, includeCanonical bool) (messageDigests, error) {
+	var digests messageDigests
 	err := client.StreamMessage(ctx, uid, func(reader io.Reader, size int64) error {
-		literalSize = size
+		digests.size = size
 		if size == 0 && !sizeKnown {
 			return issue(domain.MessageQuarantined, "TB-MAIL-SOURCE-EMPTY", "The source returned an empty message.")
 		}
-		hash := sha256.New()
-		written, err := io.CopyBuffer(hash, reader, make([]byte, 64*1024))
+		exact := sha256.New()
+		var canonical *canonicalLineEndingHasher
+		writer := io.Writer(exact)
+		if includeCanonical {
+			canonical = newCanonicalLineEndingHasher()
+			writer = io.MultiWriter(exact, canonical)
+		}
+		written, err := io.CopyBuffer(writer, reader, make([]byte, 64*1024))
 		if err != nil {
 			return err
 		}
 		if written != size {
 			return issue(domain.MessageQuarantined, "TB-MAIL-SOURCE-SIZE-MISMATCH", fmt.Sprintf("The source returned %d instead of %d bytes.", written, size))
 		}
-		digest = hex.EncodeToString(hash.Sum(nil))
+		digests.exact = hex.EncodeToString(exact.Sum(nil))
+		if canonical != nil {
+			digests.canonical = canonical.sum()
+		}
 		return nil
 	})
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "body not returned") || strings.Contains(strings.ToLower(err.Error()), "literal") {
 			var typed *mailIssueError
 			if !errors.As(err, &typed) {
-				return "", literalSize, issue(domain.MessageQuarantined, "TB-MAIL-SOURCE-LITERAL-MISSING", "The server did not return a complete raw body.")
+				return digests, issue(domain.MessageQuarantined, "TB-MAIL-SOURCE-LITERAL-MISSING", "The server did not return a complete raw body.")
 			}
 		}
-		return "", literalSize, err
+		return digests, err
 	}
-	return digest, literalSize, nil
+	return digests, nil
 }
 
-func verifyDestinationMessage(ctx context.Context, client mailimap.Client, uid uint32, expectedSize int64, sourceSHA string, fullHash bool) (string, error) {
+func hashSelectedMessage(ctx context.Context, client mailimap.Client, uid uint32, _ int64, sizeKnown bool) (string, int64, error) {
+	digests, err := hashSelectedMessageDigests(ctx, client, uid, sizeKnown, false)
+	return digests.exact, digests.size, err
+}
+
+func verifyDestinationMessage(ctx context.Context, client mailimap.Client, uid uint32, expectedSize int64, sourceSHA, sourceCanonicalSHA string, fullHash bool) (string, error) {
 	meta, err := client.FetchMetadata(ctx, uid)
 	if err != nil {
 		return "", issue(domain.MessageFailed, "TB-MAIL-VERIFY-MISSING", "The newly stored destination message could not be opened again.")
 	}
-	if meta.SizeKnown && meta.Size != expectedSize {
-		return "", issue(domain.MessageFailed, "TB-MAIL-VERIFY-SIZE", fmt.Sprintf("The destination reports %d instead of %d bytes.", meta.Size, expectedSize))
-	}
 	if !fullHash {
+		if meta.SizeKnown && meta.Size != expectedSize {
+			return "", issue(domain.MessageFailed, "TB-MAIL-VERIFY-SIZE", fmt.Sprintf("The destination reports %d instead of %d bytes.", meta.Size, expectedSize))
+		}
 		return "", nil
 	}
-	destinationSHA, literalSize, err := hashSelectedMessage(ctx, client, uid, expectedSize, true)
+	destination, err := hashSelectedMessageDigests(ctx, client, uid, true, sourceCanonicalSHA != "")
 	if err != nil {
 		return "", issue(domain.MessageFailed, "TB-MAIL-VERIFY-READ", "The destination message could not be read completely for verification.")
 	}
-	if literalSize != expectedSize {
-		return destinationSHA, issue(domain.MessageFailed, "TB-MAIL-VERIFY-SIZE", fmt.Sprintf("The destination message contains %d instead of %d bytes.", literalSize, expectedSize))
+	if destination.size == expectedSize && sourceSHA != "" && destination.exact == sourceSHA {
+		return destination.exact, nil
 	}
-	if sourceSHA == "" || destinationSHA != sourceSHA {
-		return destinationSHA, issue(domain.MessageFailed, "TB-MAIL-VERIFY-HASH", "The SHA-256 hash of the destination message does not match the source.")
+	if sourceCanonicalSHA != "" && destination.canonical == sourceCanonicalSHA {
+		return destination.exact, nil
 	}
-	return destinationSHA, nil
+	if destination.size != expectedSize {
+		return destination.exact, issue(domain.MessageFailed, "TB-MAIL-VERIFY-SIZE", fmt.Sprintf("The destination message contains %d instead of %d bytes.", destination.size, expectedSize))
+	}
+	if sourceSHA == "" || destination.exact != sourceSHA {
+		return destination.exact, issue(domain.MessageFailed, "TB-MAIL-VERIFY-HASH", "The SHA-256 hash of the destination message does not match the source.")
+	}
+	return destination.exact, nil
 }
 
 func matchingDestinationUIDs(ctx context.Context, client mailimap.Client, after uint32, expectedSize int64, sourceSHA string) ([]uint32, error) {
@@ -1015,7 +1084,14 @@ func (s *Service) worker(ctx context.Context, id int64, request domain.StartRequ
 				_ = s.db.AddMessageWarning(ctx, id, folder.ID, uid, "TB-MAIL-SOURCE-NO-MESSAGE-ID", "The message has no usable Message-ID.")
 			}
 			if existing.PolicyOverride == string(domain.MailIssueVerifyAgain) {
-				destinationSHA, verifyErr := verifyDestinationMessage(ctx, dst, existing.DestinationUID, meta.Size, existing.SourceSHA, true)
+				source, sourceErr := hashSelectedMessageDigests(ctx, src, uid, meta.SizeKnown, true)
+				if sourceErr != nil || (existing.SourceSHA != "" && source.exact != existing.SourceSHA) {
+					message := "The source message changed since the destination copy was created; verification was not approved."
+					_ = s.db.FailMessageCode(ctx, id, folder.ID, uid, domain.MessageFailed, "TB-MAIL-VERIFY-SOURCE-CHANGED", message)
+					failedMessages.Add(1)
+					continue
+				}
+				destinationSHA, verifyErr := verifyDestinationMessage(ctx, dst, existing.DestinationUID, source.size, source.exact, source.canonical, true)
 				if verifyErr != nil {
 					var typed *mailIssueError
 					if errors.As(verifyErr, &typed) {
@@ -1026,9 +1102,9 @@ func (s *Service) worker(ctx context.Context, id int64, request domain.StartRequ
 					failedMessages.Add(1)
 					continue
 				}
-				if err := s.db.CompleteVerifiedMessage(ctx, id, folder.ID, uidValidity, uid, existing.DestinationUID, meta.Size, existing.SourceSHA, destinationSHA, "verified"); err == nil {
+				if err := s.db.CompleteVerifiedMessage(ctx, id, folder.ID, uidValidity, uid, existing.DestinationUID, source.size, source.exact, destinationSHA, "verified"); err == nil {
 					copiedMessages.Add(1)
-					copiedBytes.Add(meta.Size)
+					copiedBytes.Add(source.size)
 				}
 				continue
 			}
@@ -1057,6 +1133,7 @@ func (s *Service) worker(ctx context.Context, id int64, request domain.StartRequ
 			}
 			var appendResult mailimap.AppendResult
 			var sha string
+			var canonicalSHA string
 			var transferErr error
 			transferredSize := meta.Size
 			sourceSizeMismatch := false
@@ -1134,9 +1211,18 @@ func (s *Service) worker(ctx context.Context, id int64, request domain.StartRequ
 					}
 					appendMeta.Size = size
 					hash := sha256.New()
-					result, appendErr := dst.AppendMessage(ctx, folder.DestinationName, appendMeta, io.TeeReader(reader, hash), allowed, request.Options.ExcludedKeywords)
+					var canonical *canonicalLineEndingHasher
+					writer := io.Writer(hash)
+					if sourceSizeMismatch {
+						canonical = newCanonicalLineEndingHasher()
+						writer = io.MultiWriter(hash, canonical)
+					}
+					result, appendErr := dst.AppendMessage(ctx, folder.DestinationName, appendMeta, io.TeeReader(reader, writer), allowed, request.Options.ExcludedKeywords)
 					if appendErr == nil || mailimap.IsUncertainAppend(appendErr) {
 						sha = hex.EncodeToString(hash.Sum(nil))
+						if canonical != nil {
+							canonicalSHA = canonical.sum()
+						}
 						appendResult = result
 					}
 					return appendErr
@@ -1190,7 +1276,7 @@ func (s *Service) worker(ctx context.Context, id int64, request domain.StartRequ
 				if transferErr == nil {
 					_ = s.db.MarkMessageVerifying(ctx, id, folder.ID, uid, appendResult.UID, sha)
 					fullHash := request.Options.VerificationMode != domain.VerificationMetadata || sourceSizeMismatch
-					destinationSHA, verifyErr := verifyDestinationMessage(ctx, dst, appendResult.UID, actualSize, sha, fullHash)
+					destinationSHA, verifyErr := verifyDestinationMessage(ctx, dst, appendResult.UID, actualSize, sha, canonicalSHA, fullHash)
 					if verifyErr != nil {
 						transferErr = verifyErr
 					} else {
@@ -1439,7 +1525,7 @@ func (s *Service) ResolveSourceDeletions(ctx context.Context, migrationID int64,
 			uid = matches[0]
 		}
 		if record.SourceSHA != "" {
-			if _, hashErr := verifyDestinationMessage(ctx, client, uid, record.Size, record.SourceSHA, true); hashErr != nil {
+			if _, hashErr := verifyDestinationMessage(ctx, client, uid, record.Size, record.SourceSHA, "", true); hashErr != nil {
 				failure(fmt.Errorf("check destination hash: %w", hashErr))
 				continue
 			}

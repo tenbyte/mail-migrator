@@ -24,3 +24,15 @@ describe('reset backend bindings', () => {
     expect(reset).toHaveBeenCalledOnce()
   })
 })
+
+describe('mail issue backend bindings', () => {
+  it('normalizes legacy null action lists', async () => {
+    const issue = {
+      id: 1, migrationId: 3, folder: 'Sent', sourceUid: 70, size: 462, state: 'SKIPPED',
+      errorCode: 'TB-MAIL-VERIFY-SIZE', message: 'Size mismatch', verification: 'failed', allowedActions: null,
+    }
+    window.go = { main: { App: { JobMailIssues: vi.fn().mockResolvedValue([issue]) } as never } }
+
+    await expect(backend.mailIssues(3)).resolves.toEqual([{ ...issue, allowedActions: [] }])
+  })
+})

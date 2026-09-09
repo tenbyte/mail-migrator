@@ -887,14 +887,14 @@ func (d *DB) reportEvents(ctx context.Context, migrationID int64, level string) 
 }
 
 func (d *DB) MailIssues(ctx context.Context, migrationID int64) ([]domain.MailIssue, error) {
-	rows, err := d.sql.QueryContext(ctx, `SELECT m.id,m.migration_id,f.source_name,m.source_uid,m.size,m.status,m.error_code,m.last_error,m.verification_status,m.destination_uid,COALESCE(m.sha256,'') FROM messages m JOIN folders f ON f.id=m.folder_id WHERE m.migration_id=? AND (m.error_code<>'' OR m.status IN (?,?,?,?)) ORDER BY f.source_name,m.source_uid`, migrationID, domain.MessageQuarantined, domain.MessageUnknown, domain.MessageFailed, domain.MessageSkipped)
+	rows, err := d.sql.QueryContext(ctx, `SELECT m.id,m.migration_id,f.source_name,m.source_uid,m.size,m.status,m.error_code,m.last_error,m.verification_status,m.destination_uid,COALESCE(m.sha256,'') FROM messages m JOIN folders f ON f.id=m.folder_id WHERE m.migration_id=? AND m.status IN (?,?,?) ORDER BY f.source_name,m.source_uid`, migrationID, domain.MessageQuarantined, domain.MessageUnknown, domain.MessageFailed)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	issues := make([]domain.MailIssue, 0)
 	for rows.Next() {
-		var issue domain.MailIssue
+		issue := domain.MailIssue{AllowedActions: make([]domain.MailIssueResolution, 0)}
 		var destinationUID sql.NullInt64
 		var sourceSHA string
 		if err := rows.Scan(&issue.ID, &issue.MigrationID, &issue.Folder, &issue.SourceUID, &issue.Size, &issue.State, &issue.ErrorCode, &issue.Message, &issue.Verification, &destinationUID, &sourceSHA); err != nil {

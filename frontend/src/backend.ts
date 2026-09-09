@@ -80,7 +80,7 @@ export const backend = {
   exportSupport: (id: number) => call(desktop => desktop.ExportSupportBundle(id)),
   conflicts: (id: number) => call(desktop => desktop.JobConflicts(id)).then(items => items ?? []),
   resolveConflict: (id: number, resolution: 'source' | 'destination') => call(desktop => desktop.ResolveJobConflict(id, resolution)),
-  mailIssues: (id: number) => call(desktop => desktop.JobMailIssues(id)).then(items => items ?? []),
+  mailIssues: (id: number) => call(desktop => desktop.JobMailIssues(id)).then(items => (items ?? []).map(item => ({ ...item, allowedActions: item.allowedActions ?? [] }))),
   resolveMailIssue: (id: number, resolution: MailIssueResolution) => call(desktop => desktop.ResolveMailIssue(id, resolution)),
   sourceDeletions: (id: number) => call(desktop => desktop.JobSourceDeletions(id)).then(items => items ?? []),
   mailboxNotices: (id: number) => call(desktop => desktop.JobMailboxNotices(id)),

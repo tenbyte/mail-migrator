@@ -122,4 +122,4 @@ jobs:
             IMAP migration is supported. CalDAV and CardDAV are experimental Alpha features and may not work reliably yet. The software is provided without warranties. See the included `LICENSE` and `NOTICE` files for details.
 
             These builds are not currently signed or notarized. Windows SmartScreen or macOS Gatekeeper may display a warning when you open them.
-        run: gh release create "$GITHUB_REF_NAME" release/* --verify-tag --generate-notes --notes "$RELEASE_DISCLAIMER" --title "Tenbyte Mail Migrator $GITHUB_REF_NAME"
+        run: gh release create "$GITHUB_REF_NAME" release/* --verify-tag --generate-notes --notes "$RELEASE_DISCLAIMER" --title "$GITHUB_REF_NAME Tenbyte Mail Migrator"

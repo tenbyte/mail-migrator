@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -344,6 +345,45 @@ func TestHashSelectedMessagePreservesNonStandardRawBytes(t *testing.T) {
 	digest, size, err := hashSelectedMessage(context.Background(), client, 7, int64(len(raw)), true)
 	if err != nil || size != int64(len(raw)) || digest == "" {
 		t.Fatalf("non-standard raw message was not hashed byte-exactly: digest=%q size=%d err=%v", digest, size, err)
+	}
+}
+
+func TestVerifyDestinationAcceptsOnlyEquivalentLineEndingNormalization(t *testing.T) {
+	destinationRaw := []byte(strings.Repeat("123456789\n", 40) + strings.Repeat("x", 22))
+	sourceRaw := bytes.ReplaceAll(destinationRaw, []byte("\n"), []byte("\r\n"))
+	if len(sourceRaw) != 462 || len(destinationRaw) != 422 {
+		t.Fatalf("invalid regression fixture sizes: source=%d destination=%d", len(sourceRaw), len(destinationRaw))
+	}
+
+	sourceClient := &reconciliationClient{raw: map[uint32][]byte{70: sourceRaw}}
+	source, err := hashSelectedMessageDigests(context.Background(), sourceClient, 70, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	destinationClient := &reconciliationClient{
+		raw:      map[uint32][]byte{70: destinationRaw},
+		metadata: map[uint32]mailimap.MessageMetadata{70: {UID: 70, Size: 422, SizeKnown: true}},
+	}
+	destinationSHA, err := verifyDestinationMessage(context.Background(), destinationClient, 70, int64(len(sourceRaw)), source.exact, source.canonical, true)
+	if err != nil || destinationSHA == "" {
+		t.Fatalf("equivalent CRLF/LF message was rejected: sha=%q err=%v", destinationSHA, err)
+	}
+
+	destinationRaw[0] = 'X'
+	_, err = verifyDestinationMessage(context.Background(), destinationClient, 70, int64(len(sourceRaw)), source.exact, source.canonical, true)
+	var mailIssue *mailIssueError
+	if !errors.As(err, &mailIssue) || mailIssue.code != "TB-MAIL-VERIFY-SIZE" {
+		t.Fatalf("different destination content was accepted: %v", err)
+	}
+}
+
+func TestCanonicalLineEndingHasherHandlesChunkBoundary(t *testing.T) {
+	hasher := newCanonicalLineEndingHasher()
+	_, _ = hasher.Write([]byte("first\r"))
+	_, _ = hasher.Write([]byte("\nsecond\r"))
+	want := sha256.Sum256([]byte("first\nsecond\r"))
+	if got := hasher.sum(); got != hex.EncodeToString(want[:]) {
+		t.Fatalf("unexpected canonical digest: %s", got)
 	}
 }
 

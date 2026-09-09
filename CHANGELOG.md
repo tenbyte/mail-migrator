@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.7.0 - 2026-09-10
+
+### Fixed
+
+- Message verification now accepts byte-identical mail whose destination server only normalizes CRLF and LF line endings after APPEND. Other content changes still fail SHA-256 verification.
+- Rechecking a previously failed verification recalculates and validates the current source content before approving the destination copy.
+- Choosing **Leave skipped** now removes the resolved message from the actionable issue list instead of returning a legacy `null` action list that could crash the interface.
+- The frontend also normalizes legacy `null` action lists defensively when loading existing migration data.
+
+### Changed
+
+- Automated GitHub release titles now put the version first, for example `v0.7.0 Tenbyte Mail Migrator`.
+
 ## 0.6.0 - 2026-09-09
 
 ### Fixed

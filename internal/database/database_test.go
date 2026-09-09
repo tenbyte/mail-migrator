@@ -439,6 +439,41 @@ func TestEmptyMailQuarantineRequiresOneExplicitRelease(t *testing.T) {
 	}
 }
 
+func TestKeptMailIssueIsRemovedFromActionList(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	request := domain.StartRequest{
+		Source: domain.AccountConfig{Host: "old", Port: 993, Encryption: domain.EncryptionTLS}, Destination: domain.AccountConfig{Host: "new", Port: 993, Encryption: domain.EncryptionTLS},
+		Mappings: []domain.FolderMapping{{Source: domain.Mailbox{Name: "Sent", UIDValidity: 7, Messages: 1, Selectable: true}, DestinationName: "Sent", DestinationExists: true, Enabled: true}},
+	}
+	migrationID, err := db.CreateMigration(ctx, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	folders, err := db.Folders(ctx, migrationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RecordMessageIssue(ctx, migrationID, folders[0].ID, 7, 70, 462, "", time.Now(), domain.MessageFailed, "TB-MAIL-VERIFY-SIZE", "Size mismatch"); err != nil {
+		t.Fatal(err)
+	}
+	issues, err := db.MailIssues(ctx, migrationID)
+	if err != nil || len(issues) != 1 || len(issues[0].AllowedActions) != 2 {
+		t.Fatalf("unexpected unresolved issue: %#v, %v", issues, err)
+	}
+	if err := db.ResolveMailIssue(ctx, issues[0].ID, domain.MailIssueKeepSkipped); err != nil {
+		t.Fatal(err)
+	}
+	issues, err = db.MailIssues(ctx, migrationID)
+	if err != nil || len(issues) != 0 {
+		t.Fatalf("kept issue remained actionable: %#v, %v", issues, err)
+	}
+}
+
 func TestCrashRecoveryNeverBlindlyRetriesAppend(t *testing.T) {
 	db, err := Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
