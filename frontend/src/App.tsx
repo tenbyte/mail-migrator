@@ -113,8 +113,8 @@ function Remember({ checked, onChange }: { checked: boolean; onChange: (value: b
 type SideStatus = ServerSummary | DAVAccountSummary | undefined
 function statusMetrics(status: SideStatus) {
   if (!status) return undefined
-  if ('folderCount' in status) return { collections: status.folderCount, objects: status.messages, bytes: status.bytes }
-  return { collections: status.collectionCount, objects: status.objects, bytes: status.bytes }
+  if ('folderCount' in status) return { collections: status.folderCount, objects: status.messages, bytes: status.bytes, bytesKnown: status.bytesKnown }
+  return { collections: status.collectionCount, objects: status.objects, bytes: status.bytes, bytesKnown: true }
 }
 
 function ConnectionPanel({ title, active, mail, dav, onMail, onDAV, status, busy, onTest }: {
@@ -127,7 +127,7 @@ function ConnectionPanel({ title, active, mail, dav, onMail, onDAV, status, busy
   return <section className="account-panel">
     <div className="panel-heading"><div><h2>{title}</h2><p>{serviceLabels[active]} account</p></div><span className={`connection-state ${ready ? 'connected' : busy ? 'checking' : ''}`}><i/>{ready ? 'Checked' : busy ? 'Checking' : 'Not checked'}</span></div>
     {active === 'mail' ? <MailFields account={mail} onChange={onMail}/> : <DAVFields endpoint={dav} onChange={onDAV} kind={active} mailAccount={mail}/>}
-    {metrics && <div className="account-summary"><div><span>Collections</span><strong>{formatNumber(metrics.collections)}</strong></div><div><span>Objects</span><strong>{formatNumber(metrics.objects)}</strong></div><div><span>Data</span><strong>{formatBytes(metrics.bytes)}</strong></div></div>}
+    {metrics && <div className="account-summary"><div><span>Collections</span><strong>{formatNumber(metrics.collections)}</strong></div><div><span>Objects</span><strong>{formatNumber(metrics.objects)}</strong></div><div><span>Data</span><strong>{metrics.bytesKnown ? formatBytes(metrics.bytes) : 'Not pre-scanned'}</strong></div></div>}
     <button className="secondary full" disabled={busy || !valid} onClick={onTest}>{busy && <span className="spinner"/>}{busy ? 'Checking connection' : ready ? 'Check again' : 'Check connection'}</button>
   </section>
 }
@@ -143,7 +143,7 @@ function MappingView({ navigation, preflight, mappingWarnings, mailMappings, set
   return <><Header {...navigation}/><main className="workspace mapping-page">
     <div className="workspace-heading"><div><button className="back-link" onClick={onBack}>‹ Connections</button><h1>Review selection</h1><p>{count} folders and collections selected</p></div><button className="primary" disabled={busy || count === 0} onClick={onStart}>{busy && <span className="spinner"/>}{busy ? 'Starting migration' : 'Start migration'}</button></div>
     {[...(preflight.warnings ?? []), ...mappingWarnings].length > 0 && <div className="notice warning"><strong>Warnings</strong><div>{[...(preflight.warnings ?? []), ...mappingWarnings].map((warning, index) => <p key={index}>{warning}</p>)}</div></div>}
-    {preflight.mail && <><MappingSection kind="mail" mappings={mailMappings} destinations={preflight.mail.destination.mailboxes ?? []} setMappings={setMailMappings}/><MailKeywordSelection keywords={preflight.mail.keywords ?? []} mappings={mailMappings} excluded={options.excludedKeywords ?? []} onChange={excludedKeywords => setOptions({ ...options, excludedKeywords })}/></>}
+    {preflight.mail && <><MappingSection kind="mail" mappings={mailMappings} destinations={preflight.mail.destination.mailboxes ?? []} setMappings={setMailMappings}/>{(preflight.mail.keywords?.length ?? 0) > 0 && <MailKeywordSelection keywords={preflight.mail.keywords} mappings={mailMappings} excluded={options.excludedKeywords ?? []} onChange={excludedKeywords => setOptions({ ...options, excludedKeywords })}/>}</>}
     {preflight.calendar && <DAVMappingSection kind="calendar" mappings={calendarMappings} destinations={preflight.calendar.destination.collections ?? []} setMappings={setCalendarMappings}/>}
     {preflight.contacts && <DAVMappingSection kind="contacts" mappings={contactMappings} destinations={preflight.contacts.destination.collections ?? []} setMappings={setContactMappings}/>}
     <DryRunSummary preflight={preflight} mailMappings={mailMappings}/>
@@ -177,7 +177,7 @@ function MailKeywordSelection({ keywords, mappings, excluded, onChange }: { keyw
 function MappingSection({ kind, mappings, destinations, setMappings }: { kind: ServiceKind; mappings: FolderMapping[]; destinations: import('./types').Mailbox[]; setMappings: (value: FolderMapping[]) => void }) {
   const targets = selectableMailboxes(destinations)
   const update = (index: number, value: FolderMapping) => setMappings(mappings.map((item, current) => current === index ? value : item))
-  return <section className="mapping-group"><div className="section-heading"><h2>{serviceLabels[kind]}</h2><span>{mappings.length} folders</span></div><div className="mapping-table"><div className="mapping-header"><span/><span>Source</span><span>Destination</span><span>Type</span></div>{mappings.map((mapping, index) => <div className={`mapping-row ${mapping.enabled ? '' : 'disabled'}`} key={mapping.source.name}><Toggle checked={mapping.enabled} label={mapping.source.name} onChange={value => update(index, { ...mapping, enabled: value })}/><div className="folder-name"><strong>{mapping.source.name}</strong><small>{formatNumber(mapping.source.messages)} messages · {formatBytes(mapping.source.size)}</small></div><div className="destination-field"><Icon name="arrow"/><div className="destination-control"><select aria-label={`Destination for ${mapping.source.name}`} value={mapping.destinationExists && targets.some(target => target.name === mapping.destinationName) ? mapping.destinationName : NEW_DESTINATION} onChange={event => update(index, chooseMailDestination(mapping, event.target.value, targets))}>{targets.map(target => <option value={target.name} key={target.name}>{target.name}</option>)}<option value={NEW_DESTINATION}>Create new folder...</option></select>{!mapping.destinationExists && <input aria-label={`Name of new destination folder for ${mapping.source.name}`} value={mapping.destinationName} placeholder="Folder name" onChange={event => update(index, { ...mapping, destinationName: event.target.value, destinationExists: false })}/>}</div></div><span className="category">{mapping.source.specialUse?.replace('\\', '') || 'Folder'}</span></div>)}</div></section>
+  return <section className="mapping-group"><div className="section-heading"><h2>{serviceLabels[kind]}</h2><span>{mappings.length} folders</span></div><div className="mapping-table"><div className="mapping-header"><span/><span>Source</span><span>Destination</span><span>Type</span></div>{mappings.map((mapping, index) => <div className={`mapping-row ${mapping.enabled ? '' : 'disabled'}`} key={mapping.source.name}><Toggle checked={mapping.enabled} label={mapping.source.name} onChange={value => update(index, { ...mapping, enabled: value })}/><div className="folder-name"><strong>{mapping.source.name}</strong><small>{formatNumber(mapping.source.messages)} messages · {mapping.source.sizeKnown ? formatBytes(mapping.source.size) : 'size determined during transfer'}</small></div><div className="destination-field"><Icon name="arrow"/><div className="destination-control"><select aria-label={`Destination for ${mapping.source.name}`} value={mapping.destinationExists && targets.some(target => target.name === mapping.destinationName) ? mapping.destinationName : NEW_DESTINATION} onChange={event => update(index, chooseMailDestination(mapping, event.target.value, targets))}>{targets.map(target => <option value={target.name} key={target.name}>{target.name}</option>)}<option value={NEW_DESTINATION}>Create new folder...</option></select>{!mapping.destinationExists && <input aria-label={`Name of new destination folder for ${mapping.source.name}`} value={mapping.destinationName} placeholder="Folder name" onChange={event => update(index, { ...mapping, destinationName: event.target.value, destinationExists: false })}/>}</div></div><span className="category">{mapping.source.specialUse?.replace('\\', '') || 'Folder'}</span></div>)}</div></section>
 }
 
 function DAVMappingSection({ kind, mappings, destinations, setMappings }: { kind: ServiceKind; mappings: CollectionMapping[]; destinations: import('./types').DAVCollection[]; setMappings: (value: CollectionMapping[]) => void }) {
@@ -187,7 +187,7 @@ function DAVMappingSection({ kind, mappings, destinations, setMappings }: { kind
 
 function DryRunSummary({ preflight, mailMappings }: { preflight: JobPreflightResult; mailMappings: FolderMapping[] }) {
   const cards = dryRunCards(preflight, mailMappings)
-  return <section className="dry-run"><div className="section-heading"><h2>Dry run completed</h2><span>{cards.length} {cards.length === 1 ? 'data type' : 'data types'}</span></div><div className="dry-run-grid">{cards.map(card => <article key={card.kind}><strong>{card.title}</strong><div>{card.metrics.map(metric => <span key={metric.label}><b>{metric.bytes ? formatBytes(metric.value) : formatNumber(metric.value)}</b>{metric.label}</span>)}</div></article>)}</div><small>No destination content is deleted. Destination changes are held as conflicts.</small></section>
+  return <section className="dry-run"><div className="section-heading"><h2>Dry run completed</h2><span>{cards.length} {cards.length === 1 ? 'data type' : 'data types'}</span></div><div className="dry-run-grid">{cards.map(card => <article key={card.kind}><strong>{card.title}</strong><div>{card.metrics.map(metric => <span key={metric.label}><b>{metric.unknown ? 'Not pre-scanned' : metric.bytes ? formatBytes(metric.value) : formatNumber(metric.value)}</b>{metric.label}</span>)}</div></article>)}</div><small>No destination content is deleted. Destination changes are held as conflicts.</small></section>
 }
 
 function Toggle({ checked, label, onChange }: { checked: boolean; label: string; onChange: (value: boolean) => void }) { return <label className="toggle"><input aria-label={`Transfer ${label}`} type="checkbox" checked={checked} onChange={event => onChange(event.target.checked)}/><i/></label> }
@@ -454,6 +454,7 @@ export default function App() {
       setCalendarMappings(calendar.mappings)
       setContactMappings(contacts.mappings)
       setMappingWarnings([...mail.warnings, ...calendar.warnings, ...contacts.warnings])
+      setOptions(current => ({ ...current, excludedKeywords: [] }))
       setPreflightDirty(false)
       if (openSelection) setView('selection')
       return true

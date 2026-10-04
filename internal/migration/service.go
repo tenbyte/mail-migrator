@@ -86,10 +86,6 @@ func (s *Service) Inspect(ctx context.Context, account domain.AccountConfig) (do
 	if err != nil {
 		return domain.ServerSummary{}, err
 	}
-	mailboxes, err = fillMailboxSizes(ctx, client, mailboxes)
-	if err != nil {
-		return domain.ServerSummary{}, err
-	}
 	summary := summarize(account.Host, caps, mailboxes)
 	if limits, limitErr := client.Limits(ctx, limitMailbox(mailboxes)); limitErr == nil {
 		summary.AppendLimit = limits.AppendLimit
@@ -106,10 +102,9 @@ func (s *Service) Preflight(ctx context.Context, source, destination domain.Acco
 		s.diagnostics.Protect(source.Host, source.Username, source.Password, source.CredentialID, destination.Host, destination.Username, destination.Password, destination.CredentialID)
 	}
 	type sideResult struct {
-		source   bool
-		summary  domain.ServerSummary
-		keywords []domain.MailKeyword
-		err      error
+		source  bool
+		summary domain.ServerSummary
+		err     error
 	}
 	results := make(chan sideResult, 2)
 	check := func(account domain.AccountConfig, sourceSide bool) {
@@ -130,16 +125,6 @@ func (s *Service) Preflight(ctx context.Context, source, destination domain.Acco
 			return
 		}
 		if sourceSide {
-			mailboxes, err = fillMailboxSizes(ctx, client, mailboxes)
-			if err != nil {
-				results <- sideResult{source: true, err: err}
-				return
-			}
-			keywords, keywordErr := inventorySourceKeywords(ctx, client, mailboxes)
-			if keywordErr != nil {
-				results <- sideResult{source: true, err: keywordErr}
-				return
-			}
 			summary := summarize(account.Host, caps, mailboxes)
 			if limits, limitErr := client.Limits(ctx, limitMailbox(mailboxes)); limitErr == nil {
 				summary.AppendLimit = limits.AppendLimit
@@ -148,7 +133,7 @@ func (s *Service) Preflight(ctx context.Context, source, destination domain.Acco
 			} else {
 				summary.Warnings = append(summary.Warnings, "IMAP quota could not be read; the transfer still checks server errors for each message.")
 			}
-			results <- sideResult{source: true, summary: summary, keywords: keywords}
+			results <- sideResult{source: true, summary: summary}
 			return
 		}
 		summary := summarize(account.Host, caps, mailboxes)
@@ -183,13 +168,10 @@ func (s *Service) Preflight(ctx context.Context, source, destination domain.Acco
 	}
 	// Results can arrive in either order.
 	var src, dst domain.ServerSummary
-	var keywords []domain.MailKeyword
 	if first.source {
 		src, dst = first.summary, second.summary
-		keywords = first.keywords
 	} else {
 		src, dst = second.summary, first.summary
-		keywords = second.keywords
 	}
 	mappings := folders.Recommend(src.Mailboxes, dst.Mailboxes)
 	for _, mapping := range mappings {
@@ -205,58 +187,7 @@ func (s *Service) Preflight(ctx context.Context, source, destination domain.Acco
 	if dst.QuotaAvailableBytes > 0 && src.Bytes > dst.QuotaAvailableBytes {
 		warnings = append(warnings, "The destination reports less free storage than the selected source data requires.")
 	}
-	return domain.PreflightResult{Source: src, Destination: dst, Mappings: mappings, Keywords: keywords, Warnings: warnings}, nil
-}
-
-func inventorySourceKeywords(ctx context.Context, client mailimap.Client, mailboxes []domain.Mailbox) ([]domain.MailKeyword, error) {
-	byName := make(map[string]*domain.MailKeyword)
-	for _, mailbox := range mailboxes {
-		if !mailbox.Selectable || mailbox.Messages == 0 {
-			continue
-		}
-		counts, err := client.ListMessageKeywords(ctx, mailbox.Name)
-		if err != nil {
-			return nil, fmt.Errorf("inventory tags in folder %q: %w", mailbox.Name, err)
-		}
-		for _, count := range counts {
-			key := strings.ToLower(count.Name)
-			item := byName[key]
-			if item == nil {
-				item = &domain.MailKeyword{Name: count.Name, Occurrences: make(map[string]int64)}
-				byName[key] = item
-			}
-			item.Occurrences[mailbox.Name] += count.Messages
-		}
-	}
-	result := make([]domain.MailKeyword, 0, len(byName))
-	for _, item := range byName {
-		result = append(result, *item)
-	}
-	sort.Slice(result, func(i, j int) bool { return strings.ToLower(result[i].Name) < strings.ToLower(result[j].Name) })
-	return result, nil
-}
-
-func fillMailboxSizes(ctx context.Context, client mailimap.Client, mailboxes []domain.Mailbox) ([]domain.Mailbox, error) {
-	for index := range mailboxes {
-		mailbox := &mailboxes[index]
-		if !mailbox.Selectable || mailbox.SizeKnown {
-			continue
-		}
-		metadata, err := client.ListMessageMetadata(ctx, mailbox.Name)
-		if err != nil {
-			return nil, fmt.Errorf("determine size of folder %q: %w", mailbox.Name, err)
-		}
-		var size int64
-		for _, message := range metadata {
-			if !message.SizeKnown || message.Size < 0 {
-				return nil, fmt.Errorf("size of folder %q is incomplete", mailbox.Name)
-			}
-			size += message.Size
-		}
-		mailbox.Size = size
-		mailbox.SizeKnown = true
-	}
-	return mailboxes, nil
+	return domain.PreflightResult{Source: src, Destination: dst, Mappings: mappings, Keywords: []domain.MailKeyword{}, Warnings: warnings}, nil
 }
 
 func limitMailbox(mailboxes []domain.Mailbox) string {
@@ -274,10 +205,25 @@ func limitMailbox(mailboxes []domain.Mailbox) string {
 }
 
 func summarize(host string, caps []string, mailboxes []domain.Mailbox) domain.ServerSummary {
-	s := domain.ServerSummary{Connected: true, Host: host, Capabilities: caps, Mailboxes: mailboxes, FolderCount: len(mailboxes)}
+	s := domain.ServerSummary{Connected: true, Host: host, Capabilities: caps, Mailboxes: mailboxes, FolderCount: len(mailboxes), BytesKnown: true}
+	unknownSize := false
 	for _, box := range mailboxes {
 		s.Messages += int64(box.Messages)
 		s.Bytes += box.Size
+		if box.UnavailableReason != "" {
+			s.BytesKnown = false
+			hint := ""
+			if strings.TrimSpace(box.Name) != box.Name {
+				hint = " Its server-provided name begins or ends with whitespace; the name was preserved unchanged."
+			}
+			s.Warnings = append(s.Warnings, fmt.Sprintf("Folder %q is unavailable and will be skipped; all other folders can still be migrated. Its messages and size are not included in the displayed total.%s Server response: %s", box.Name, hint, box.UnavailableReason))
+		} else if box.Selectable && !box.SizeKnown {
+			s.BytesKnown = false
+			unknownSize = true
+		}
+	}
+	if unknownSize {
+		s.Warnings = append(s.Warnings, "The displayed byte total is incomplete because the server did not finish reporting every folder size. This does not exclude those folders or messages from migration.")
 	}
 	for _, capability := range caps {
 		upper := strings.ToUpper(capability)

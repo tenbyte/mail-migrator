@@ -22,6 +22,8 @@ import (
 type reconciliationClient struct {
 	uids          []uint32
 	metadata      map[uint32]mailimap.MessageMetadata
+	metadataCalls int
+	keywordCalls  int
 	candidates    map[string]mailimap.Candidate
 	mailboxes     []domain.Mailbox
 	listResponses [][]domain.Mailbox
@@ -30,7 +32,6 @@ type reconciliationClient struct {
 	createErrors  map[string]error
 	raw           map[uint32][]byte
 	summaries     map[uint32]mailimap.MessageSummary
-	keywords      map[string][]mailimap.KeywordCount
 	literalSizes  map[uint32]int64
 	uidValidity   uint32
 }
@@ -54,7 +55,8 @@ func (c *reconciliationClient) SearchUIDs(context.Context, uint32) ([]uint32, er
 func (c *reconciliationClient) FetchMetadata(_ context.Context, uid uint32) (mailimap.MessageMetadata, error) {
 	return c.metadata[uid], nil
 }
-func (c *reconciliationClient) ListMessageMetadata(_ context.Context, _ string) ([]mailimap.MessageMetadata, error) {
+func (c *reconciliationClient) ListMessageMetadata(_ context.Context, mailbox string) ([]mailimap.MessageMetadata, error) {
+	c.metadataCalls++
 	result := make([]mailimap.MessageMetadata, 0, len(c.metadata))
 	for _, uid := range c.uids {
 		if metadata, ok := c.metadata[uid]; ok {
@@ -64,7 +66,8 @@ func (c *reconciliationClient) ListMessageMetadata(_ context.Context, _ string) 
 	return result, nil
 }
 func (c *reconciliationClient) ListMessageKeywords(_ context.Context, mailbox string) ([]mailimap.KeywordCount, error) {
-	return c.keywords[mailbox], nil
+	c.keywordCalls++
+	return nil, nil
 }
 func (c *reconciliationClient) FetchMessageID(_ context.Context, uid uint32) (string, error) {
 	return c.metadata[uid].MessageID, nil
@@ -110,6 +113,12 @@ type staticFactory struct{ client mailimap.Client }
 
 func (f staticFactory) Connect(context.Context, domain.AccountConfig, time.Duration, time.Duration) (mailimap.Client, error) {
 	return f.client, nil
+}
+
+type hostFactory map[string]mailimap.Client
+
+func (f hostFactory) Connect(_ context.Context, account domain.AccountConfig, _, _ time.Duration) (mailimap.Client, error) {
+	return f[account.Host], nil
 }
 
 type panicFactory struct{}
@@ -387,36 +396,50 @@ func TestCanonicalLineEndingHasherHandlesChunkBoundary(t *testing.T) {
 	}
 }
 
-func TestFillMailboxSizesInventoriesUnknownSizes(t *testing.T) {
+func TestInspectDoesNotInventoryMessages(t *testing.T) {
 	client := &reconciliationClient{
-		uids: []uint32{1, 2},
-		metadata: map[uint32]mailimap.MessageMetadata{
-			1: {UID: 1, Size: 10, SizeKnown: true},
-			2: {UID: 2, Size: 25, SizeKnown: true},
-		},
-	}
-	mailboxes, err := fillMailboxSizes(context.Background(), client, []domain.Mailbox{{Name: "INBOX", Selectable: true, Messages: 2}})
-	if err != nil || len(mailboxes) != 1 || !mailboxes[0].SizeKnown || mailboxes[0].Size != 35 {
-		t.Fatalf("unexpected mailbox inventory: %#v, %v", mailboxes, err)
-	}
-}
-
-func TestInspectInventoriesUnknownMailboxSizes(t *testing.T) {
-	client := &reconciliationClient{
-		uids:      []uint32{1, 2},
 		mailboxes: []domain.Mailbox{{Name: "INBOX", Selectable: true, Messages: 2}},
-		metadata: map[uint32]mailimap.MessageMetadata{
-			1: {UID: 1, Size: 10, SizeKnown: true},
-			2: {UID: 2, Size: 25, SizeKnown: true},
-		},
 	}
 	service := New(nil, staticFactory{client: client}, nil)
 	summary, err := service.Inspect(context.Background(), domain.AccountConfig{Host: "mail.example.test"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if summary.Bytes != 35 || len(summary.Mailboxes) != 1 || !summary.Mailboxes[0].SizeKnown || summary.Mailboxes[0].Size != 35 {
-		t.Fatalf("account inspection retained a false zero-byte size: %#v", summary)
+	if client.metadataCalls != 0 || client.keywordCalls != 0 {
+		t.Fatalf("connection check inventoried messages: metadata=%d keywords=%d", client.metadataCalls, client.keywordCalls)
+	}
+	if summary.Bytes != 0 || summary.BytesKnown || len(summary.Mailboxes) != 1 || summary.Mailboxes[0].SizeKnown {
+		t.Fatalf("unknown server size was not represented honestly: %#v", summary)
+	}
+}
+
+func TestPreflightDoesNotInventoryMessages(t *testing.T) {
+	source := &reconciliationClient{mailboxes: []domain.Mailbox{{Name: "INBOX", Selectable: true, Messages: 30_000}}}
+	destination := &reconciliationClient{mailboxes: []domain.Mailbox{{Name: "INBOX", Selectable: true, SizeKnown: true}}}
+	service := New(nil, hostFactory{"source": source, "destination": destination}, nil)
+	result, err := service.Preflight(context.Background(), domain.AccountConfig{Host: "source"}, domain.AccountConfig{Host: "destination"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if source.metadataCalls != 0 || source.keywordCalls != 0 || destination.metadataCalls != 0 || destination.keywordCalls != 0 {
+		t.Fatalf("preflight inventoried messages: source metadata=%d keywords=%d, destination metadata=%d keywords=%d", source.metadataCalls, source.keywordCalls, destination.metadataCalls, destination.keywordCalls)
+	}
+	if len(result.Mappings) != 1 || !result.Mappings[0].Enabled || len(result.Keywords) != 0 {
+		t.Fatalf("folder-only preflight changed migration scope: %#v", result)
+	}
+}
+
+func TestSummarizeWarnsAndExcludesUnavailableWhitespaceFolder(t *testing.T) {
+	mailboxes := []domain.Mailbox{
+		{Name: "INBOX", Selectable: true, Messages: 2, Size: 35, SizeKnown: true},
+		{Name: "Parent/Folder ", UnavailableReason: "folder index unavailable"},
+	}
+	summary := summarize("mail.example.test", nil, mailboxes)
+	if summary.Bytes != 35 || summary.Messages != 2 {
+		t.Fatalf("unavailable folder changed known totals: %#v", summary)
+	}
+	if len(summary.Warnings) != 1 || !strings.Contains(summary.Warnings[0], `"Parent/Folder "`) || !strings.Contains(summary.Warnings[0], "whitespace") {
+		t.Fatalf("missing actionable folder warning: %#v", summary.Warnings)
 	}
 }
 
@@ -787,27 +810,5 @@ func TestResolveSourceDeletionFailsClosedOnUIDValidityChange(t *testing.T) {
 	}
 	if len(client.deletes) != 0 {
 		t.Fatalf("delete was issued after unsafe UIDVALIDITY change: %v", client.deletes)
-	}
-}
-
-func TestInventorySourceKeywordsAggregatesPerFolderCaseInsensitively(t *testing.T) {
-	client := &reconciliationClient{keywords: map[string][]mailimap.KeywordCount{
-		"INBOX":   {{Name: "Project-X", Messages: 3}, {Name: "$HasNoAttachment", Messages: 2}},
-		"Archive": {{Name: "project-x", Messages: 4}},
-	}}
-	mailboxes := []domain.Mailbox{
-		{Name: "INBOX", Selectable: true, Messages: 5},
-		{Name: "Archive", Selectable: true, Messages: 4},
-		{Name: "Virtual", Selectable: false, Messages: 10},
-	}
-	keywords, err := inventorySourceKeywords(context.Background(), client, mailboxes)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(keywords) != 2 || keywords[0].Name != "$HasNoAttachment" || keywords[0].Occurrences["INBOX"] != 2 {
-		t.Fatalf("unexpected technical keyword inventory: %#v", keywords)
-	}
-	if keywords[1].Name != "Project-X" || keywords[1].Occurrences["INBOX"] != 3 || keywords[1].Occurrences["Archive"] != 4 {
-		t.Fatalf("unexpected merged keyword inventory: %#v", keywords)
 	}
 }

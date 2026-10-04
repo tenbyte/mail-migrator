@@ -86,16 +86,17 @@ type FinalizeMailboxNoticesRequest struct {
 }
 
 type Mailbox struct {
-	Name        string   `json:"name"`
-	Delimiter   rune     `json:"delimiter"`
-	Attributes  []string `json:"attributes"`
-	SpecialUse  string   `json:"specialUse,omitempty"`
-	Selectable  bool     `json:"selectable"`
-	Messages    uint32   `json:"messages"`
-	UIDValidity uint32   `json:"uidValidity"`
-	UIDNext     uint32   `json:"uidNext"`
-	Size        int64    `json:"size"`
-	SizeKnown   bool     `json:"sizeKnown"`
+	Name              string   `json:"name"`
+	Delimiter         rune     `json:"delimiter"`
+	Attributes        []string `json:"attributes"`
+	SpecialUse        string   `json:"specialUse,omitempty"`
+	Selectable        bool     `json:"selectable"`
+	Messages          uint32   `json:"messages"`
+	UIDValidity       uint32   `json:"uidValidity"`
+	UIDNext           uint32   `json:"uidNext"`
+	Size              int64    `json:"size"`
+	SizeKnown         bool     `json:"sizeKnown"`
+	UnavailableReason string   `json:"unavailableReason,omitempty"`
 }
 
 type FolderMapping struct {
@@ -114,6 +115,7 @@ type ServerSummary struct {
 	FolderCount         int       `json:"folderCount"`
 	Messages            int64     `json:"messages"`
 	Bytes               int64     `json:"bytes"`
+	BytesKnown          bool      `json:"bytesKnown"`
 	UIDPlus             bool      `json:"uidPlus"`
 	AppendLimit         int64     `json:"appendLimit,omitempty"`
 	QuotaAvailableBytes int64     `json:"quotaAvailableBytes,omitempty"`

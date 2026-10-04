@@ -104,7 +104,7 @@ export function navigationLocked(progress?: Progress): boolean {
 export interface DryRunCard {
   kind: ServiceKind
   title: string
-  metrics: Array<{ value: number; label: string; bytes?: boolean }>
+  metrics: Array<{ value: number; label: string; bytes?: boolean; unknown?: boolean }>
 }
 
 function davCard(kind: 'calendar' | 'contacts', result: DAVPreflightResult): DryRunCard {
@@ -124,14 +124,15 @@ export function dryRunCards(preflight: JobPreflightResult, mailMappings: FolderM
   const cards: DryRunCard[] = []
   if (preflight.mail) {
     const selected = mailMappings.filter(mapping => mapping.enabled)
+    const sizeUnknown = selected.some(mapping => !mapping.source.sizeKnown)
     cards.push({
       kind: 'mail',
       title: 'Mail',
       metrics: [
         { value: selected.length, label: 'folders selected' },
         { value: selected.reduce((sum, mapping) => sum + mapping.source.messages, 0), label: 'messages' },
-        { value: selected.reduce((sum, mapping) => sum + mapping.source.size, 0), label: 'Datenmenge', bytes: true },
-        { value: selected.reduce((sum, mapping) => sum + mapping.source.size, 0), label: 'additional full verification', bytes: true },
+        { value: selected.reduce((sum, mapping) => sum + mapping.source.size, 0), label: 'Datenmenge', bytes: true, unknown: sizeUnknown },
+        { value: selected.reduce((sum, mapping) => sum + mapping.source.size, 0), label: 'additional full verification', bytes: true, unknown: sizeUnknown },
         { value: selected.filter(mapping => mapping.destinationExists).length, label: 'bestehende Ziele' },
         { value: selected.filter(mapping => !mapping.destinationExists).length, label: 'neue Ziele' },
       ],

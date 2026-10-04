@@ -416,8 +416,8 @@ func TestApplicationVersionsAreConsistent(t *testing.T) {
 		"frontend/package-lock.json":      lockfile["version"],
 		"frontend/package-lock.json root": lockRoot["version"],
 	} {
-		if version != "0.7.0" {
-			t.Errorf("%s has version %v, want 0.7.0", path, version)
+		if version != appVersion {
+			t.Errorf("%s has version %v, want %s", path, version, appVersion)
 		}
 	}
 }

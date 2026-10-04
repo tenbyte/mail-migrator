@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.7.1 - 2026-10-04
+
+### Fixed
+
+- IMAP connections now wait for the server greeting before sending LOGIN, avoiding intermittent login stalls when checking an account.
+- The connection timeout now covers the complete setup, including TLS/STARTTLS, the greeting, login, capabilities, and IMAP4rev2 negotiation. Successful connections retain their normal transfer stall timeout.
+- Login timeouts and cancellations are reported separately from explicit authentication rejections.
+- Folder inspection handles legacy servers that reject EXAMINE by retrying SELECT. Individually unavailable folders are skipped with a warning without blocking the remaining folders.
+
+### Changed
+
+- Connection checks and preflight no longer scan individual messages to determine folder sizes or inventory tags. Sizes that the server does not report appear as **Not pre-scanned** rather than zero.
+- Message inventories request only UIDs and sizes; full SHA-256 verification remains part of the transfer.
+- Source folder names, including leading or trailing whitespace, are preserved unchanged.
+
+### Security
+
+- Updated the transitive frontend development dependency `brace-expansion` from 5.0.9 to 5.0.12 to resolve denial-of-service advisories.
+
 ## 0.7.0 - 2026-09-10
 
 ### Fixed

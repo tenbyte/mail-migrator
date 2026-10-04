@@ -55,4 +55,12 @@ describe('navigation and dry run', () => {
     expect(labels.join(' ')).not.toContain('DAV')
     expect(labels).toContain('messages')
   })
+
+  it('marks mail bytes unknown when any selected folder was not pre-scanned', () => {
+    const mapping = mailMapping()
+    mapping.source.sizeKnown = false
+    const preflight = { mail: { source: {}, destination: {}, mappings: [], warnings: [] }, warnings: [] } as unknown as JobPreflightResult
+    const bytes = dryRunCards(preflight, [mapping]).flatMap(card => card.metrics).filter(metric => metric.bytes)
+    expect(bytes.every(metric => metric.unknown)).toBe(true)
+  })
 })

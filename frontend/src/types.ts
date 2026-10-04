@@ -45,9 +45,9 @@ export interface DAVEndpoint {
   credentialId?: string
 }
 
-export interface Mailbox { name: string; delimiter: number; attributes: string[]; specialUse?: string; selectable: boolean; messages: number; uidValidity: number; uidNext: number; size: number; sizeKnown: boolean }
+export interface Mailbox { name: string; delimiter: number; attributes: string[]; specialUse?: string; selectable: boolean; messages: number; uidValidity: number; uidNext: number; size: number; sizeKnown: boolean; unavailableReason?: string }
 export interface FolderMapping { source: Mailbox; destinationName: string; destinationDelimiter: number; destinationExists: boolean; enabled: boolean }
-export interface ServerSummary { connected: boolean; host: string; capabilities: string[]; mailboxes: Mailbox[]; folderCount: number; messages: number; bytes: number; uidPlus: boolean; appendLimit?: number; quotaAvailableBytes?: number; quotaUsedBytes?: number; warnings: string[] }
+export interface ServerSummary { connected: boolean; host: string; capabilities: string[]; mailboxes: Mailbox[]; folderCount: number; messages: number; bytes: number; bytesKnown: boolean; uidPlus: boolean; appendLimit?: number; quotaAvailableBytes?: number; quotaUsedBytes?: number; warnings: string[] }
 export interface MailKeyword { name: string; occurrences: Record<string, number> }
 export interface PreflightResult { source: ServerSummary; destination: ServerSummary; mappings: FolderMapping[]; keywords: MailKeyword[]; warnings: string[] }
 

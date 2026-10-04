@@ -24,6 +24,12 @@ The Go application separates protocol handling from migration state:
 
 Source accounts are read-only during migration and delta sync. A manual delta sync inventories both sides and presents source deletions as explicit destination actions. Unsupported safe deletion operations stop without a broad fallback. The only source write is an explicitly confirmed mailbox-notice cutover, which appends one unread message to the source `INBOX`.
 
+## IMAP connection setup and inspection
+
+The connection timeout covers DNS/TCP, TLS or STARTTLS, the server greeting, LOGIN, capabilities, and optional IMAP4rev2 negotiation. LOGIN is sent only after the greeting has been read. Expiry or cancellation closes the setup socket to interrupt protocol waits; after successful setup, this temporary cancellation hook is removed and the normal stall timeout applies.
+
+Connection checks and preflight read folder statistics with LIST-STATUS or STATUS. They do not inventory individual messages or tags to calculate missing folder sizes. Unknown sizes remain explicitly unknown in the interface. A legacy server rejection of EXAMINE can fall back to SELECT, while source operations continue to use non-mutating commands and PEEK body reads. A folder rejected by both status/open attempts is marked unavailable and skipped without excluding other folders.
+
 ## Mailbox notices
 
 Global mailbox-notice settings live in the local settings table. Creating a mail migration snapshots both source and destination templates into one schema-v5 row per side and assigns a random persistent Message-ID to each enabled notice. Editing the global settings later does not affect an existing migration.

@@ -95,6 +95,13 @@ type Factory interface {
 	Connect(context.Context, domain.AccountConfig, time.Duration, time.Duration) (Client, error)
 }
 
+// IsMailboxUnavailable reports a server rejection that is scoped to one
+// mailbox. Transport and cancellation errors must still abort the operation.
+func IsMailboxUnavailable(err error) bool {
+	var imapErr *imap.Error
+	return errors.As(err, &imapErr) && (imapErr.Type == imap.StatusResponseTypeNo || imapErr.Type == imap.StatusResponseTypeBad)
+}
+
 // DestinationClient intentionally lives outside Client so source-facing code
 // cannot issue destructive IMAP commands.
 type DestinationClient interface {
@@ -122,6 +129,11 @@ func (RealFactory) ConnectDestination(ctx context.Context, account domain.Accoun
 }
 
 func connect(ctx context.Context, account domain.AccountConfig, connectTimeout, stallTimeout time.Duration) (*realClient, error) {
+	tlsConfig := &tls.Config{ServerName: account.Host, MinVersion: tls.VersionTLS12}
+	return connectWithTLSConfig(ctx, account, connectTimeout, stallTimeout, tlsConfig)
+}
+
+func connectWithTLSConfig(ctx context.Context, account domain.AccountConfig, connectTimeout, stallTimeout time.Duration, tlsConfig *tls.Config) (*realClient, error) {
 	if account.Host == "" || account.Port < 1 || account.Port > 65535 {
 		return nil, errors.New("valid IMAP host and port are required")
 	}
@@ -134,18 +146,28 @@ func connect(ctx context.Context, account domain.AccountConfig, connectTimeout, 
 	if stallTimeout <= 0 {
 		stallTimeout = 90 * time.Second
 	}
+	// The connection budget covers DNS, TCP, TLS, greeting, LOGIN and setup
+	// commands. Closing the socket also interrupts protocol waits that do not
+	// accept a context and whose own deadlines can be reset by the decoder.
+	setupCtx, cancelSetup := context.WithTimeout(ctx, connectTimeout)
+	defer cancelSetup()
 	dialer := &net.Dialer{Timeout: connectTimeout, KeepAlive: 30 * time.Second}
-	raw, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(account.Host, strconv.Itoa(account.Port)))
+	raw, err := dialer.DialContext(setupCtx, "tcp", net.JoinHostPort(account.Host, strconv.Itoa(account.Port)))
 	if err != nil {
 		return nil, fmt.Errorf("connect to IMAP server: %w", err)
 	}
+	stopSetupClose := context.AfterFunc(setupCtx, func() { _ = raw.Close() })
+	defer stopSetupClose()
 	activity := &activityConn{Conn: raw, stall: stallTimeout}
-	tlsConfig := &tls.Config{ServerName: account.Host, MinVersion: tls.VersionTLS12}
 	options := &imapclient.Options{TLSConfig: tlsConfig}
 	var c *imapclient.Client
 	if account.Encryption == domain.EncryptionTLS {
 		tlsConn := tls.Client(activity, tlsConfig)
-		if err := tlsConn.HandshakeContext(ctx); err != nil {
+		err := tlsConn.HandshakeContext(setupCtx)
+		if err != nil {
+			err = setupError(setupCtx, "TLS handshake", err)
+		}
+		if err != nil {
 			raw.Close()
 			return nil, fmt.Errorf("TLS certificate or handshake failed: %w", err)
 		}
@@ -153,27 +175,71 @@ func connect(ctx context.Context, account domain.AccountConfig, connectTimeout, 
 	} else {
 		c, err = imapclient.NewStartTLS(activity, options)
 		if err != nil {
+			err = setupError(setupCtx, "STARTTLS", err)
+		}
+		if err != nil {
 			raw.Close()
 			return nil, fmt.Errorf("STARTTLS failed: %w", err)
 		}
 	}
-	if err := c.Login(account.Username, account.Password).Wait(); err != nil {
+	// LOGIN must follow the server greeting. Sending it as soon as TLS is
+	// established races the greeting and capability handling on some servers.
+	err = c.WaitGreeting()
+	if err != nil {
+		err = setupError(setupCtx, "server greeting", err)
+	}
+	if err != nil {
+		_ = c.Close()
+		return nil, err
+	}
+	err = c.Login(account.Username, account.Password).Wait()
+	if err != nil {
+		err = setupError(setupCtx, "login", err)
+	}
+	if err != nil {
 		c.Close()
-		return nil, fmt.Errorf("IMAP authentication failed: %w", err)
+		return nil, err
 	}
 	client := &realClient{client: c}
 	caps, capErr := client.ensureCapabilities()
 	if capErr != nil {
 		_ = c.Close()
-		return nil, fmt.Errorf("read IMAP capabilities: %w", capErr)
+		return nil, setupError(setupCtx, "capabilities", capErr)
 	}
 	if needsRev2Enable(caps) {
-		if _, enableErr := c.Enable(imap.CapIMAP4rev2).Wait(); enableErr != nil {
+		_, enableErr := c.Enable(imap.CapIMAP4rev2).Wait()
+		if enableErr != nil {
 			_ = c.Close()
-			return nil, fmt.Errorf("enable IMAP4rev2 compatibility mode: %w", enableErr)
+			return nil, setupError(setupCtx, "IMAP4rev2 setup", enableErr)
 		}
 	}
+	// Detach before cancelling the setup context so a successful connection
+	// keeps the normal transfer/stall lifetime rather than the setup budget.
+	if !stopSetupClose() {
+		_ = c.Close()
+		return nil, setupError(setupCtx, "connection setup", context.Canceled)
+	}
 	return client, nil
+}
+
+func setupError(ctx context.Context, phase string, err error) error {
+	if ctx.Err() != nil {
+		err = ctx.Err()
+	}
+	var networkError net.Error
+	// go-imap sometimes formats the underlying I/O error as text rather than
+	// preserving its type. Recognize its fixed timeout marker as well.
+	if errors.Is(err, context.DeadlineExceeded) || errors.As(err, &networkError) && networkError.Timeout() || strings.Contains(strings.ToLower(err.Error()), "i/o timeout") {
+		return fmt.Errorf("IMAP %s timed out: %w", phase, err)
+	}
+	if errors.Is(err, context.Canceled) {
+		return fmt.Errorf("IMAP %s cancelled: %w", phase, err)
+	}
+	var protocolError *imap.Error
+	if errors.As(err, &protocolError) && protocolError.Code == imap.ResponseCodeAuthenticationFailed {
+		return fmt.Errorf("IMAP authentication failed: %w", err)
+	}
+	return fmt.Errorf("IMAP %s failed: %w", phase, err)
 }
 
 func needsRev2Enable(caps imap.CapSet) bool {
@@ -277,13 +343,19 @@ func (c *realClient) ListMailboxes(ctx context.Context) ([]domain.Mailbox, error
 				status, statusErr = c.client.Status(box.Name, statusOpts).Wait()
 			}
 			if statusErr != nil {
-				selected, selectErr := c.client.Select(box.Name, &imap.SelectOptions{ReadOnly: true}).Wait()
+				uidValidity, uidNext, _, selectErr := c.SelectMailbox(ctx, box.Name, true)
 				if selectErr != nil {
+					if IsMailboxUnavailable(selectErr) {
+						box.Selectable = false
+						box.UnavailableReason = fmt.Sprintf("the IMAP server cannot open this folder (%v)", selectErr)
+						result = append(result, box)
+						continue
+					}
 					return nil, fmt.Errorf("read status for %q: %w (EXAMINE fallback: %v)", box.Name, statusErr, selectErr)
 				}
-				box.Messages = selected.NumMessages
-				box.UIDNext = uint32(selected.UIDNext)
-				box.UIDValidity = selected.UIDValidity
+				box.Messages = c.selectedSize
+				box.UIDNext = uidNext
+				box.UIDValidity = uidValidity
 				if box.Messages == 0 {
 					box.SizeKnown = true
 				}
@@ -362,34 +434,22 @@ func (c *realClient) ListMessageMetadata(ctx context.Context, mailbox string) ([
 	}
 	const chunkSize = 500
 	result := make([]MessageMetadata, 0, len(uids))
-	section := &imap.FetchItemBodySection{Specifier: imap.PartSpecifierHeader, HeaderFields: []string{"Message-ID"}, Peek: true}
 	for start := 0; start < len(uids); start += chunkSize {
 		end := min(start+chunkSize, len(uids))
 		setUIDs := make([]imap.UID, end-start)
 		for i, uid := range uids[start:end] {
 			setUIDs[i] = imap.UID(uid)
 		}
-		cmd := c.client.Fetch(imap.UIDSetNum(setUIDs...), &imap.FetchOptions{UID: true, InternalDate: true, RFC822Size: true, BodySection: []*imap.FetchItemBodySection{section}})
+		cmd := c.client.Fetch(imap.UIDSetNum(setUIDs...), &imap.FetchOptions{UID: true, RFC822Size: true})
 		for msg := cmd.Next(); msg != nil; msg = cmd.Next() {
 			meta := MessageMetadata{}
 			for item := msg.Next(); item != nil; item = msg.Next() {
 				switch value := item.(type) {
 				case imapclient.FetchItemDataUID:
 					meta.UID = uint32(value.UID)
-				case imapclient.FetchItemDataInternalDate:
-					meta.InternalDate = value.Time
 				case imapclient.FetchItemDataRFC822Size:
 					meta.Size = value.Size
 					meta.SizeKnown = true
-				case imapclient.FetchItemDataBodySection:
-					if value.Literal != nil {
-						messageID, parseErr := readMessageID(value.Literal)
-						if parseErr != nil {
-							_ = cmd.Close()
-							return nil, parseErr
-						}
-						meta.MessageID = messageID
-					}
 				}
 			}
 			if meta.UID == 0 || !meta.SizeKnown {
@@ -481,6 +541,12 @@ func (c *realClient) SelectMailbox(ctx context.Context, name string, readOnly bo
 		return 0, 0, nil, err
 	}
 	data, err := c.client.Select(name, &imap.SelectOptions{ReadOnly: readOnly}).Wait()
+	if err != nil && readOnly && shouldRetrySelectReadWrite(err) {
+		// Some legacy servers cannot build/open a folder index for EXAMINE but
+		// can do so for SELECT. The migration still issues read-only commands on
+		// the source mailbox; this only changes how the mailbox is opened.
+		data, err = c.client.Select(name, &imap.SelectOptions{ReadOnly: false}).Wait()
+	}
 	if err != nil {
 		return 0, 0, nil, fmt.Errorf("open mailbox %q: %w", name, err)
 	}
@@ -491,6 +557,14 @@ func (c *realClient) SelectMailbox(ctx context.Context, name string, readOnly bo
 		flags[i] = string(f)
 	}
 	return data.UIDValidity, uint32(data.UIDNext), flags, nil
+}
+
+func shouldRetrySelectReadWrite(err error) bool {
+	var imapErr *imap.Error
+	if !errors.As(err, &imapErr) || imapErr.Type != imap.StatusResponseTypeBad {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(string(imapErr.Code)), "READ-ONLY") || strings.Contains(strings.ToUpper(imapErr.Text), "EXAMINE")
 }
 
 func (c *realClient) SearchUIDs(ctx context.Context, after uint32) ([]uint32, error) {
