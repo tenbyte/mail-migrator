@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -142,57 +143,103 @@ func TestSelectMailboxRetriesReadOnlyExamineWithSelect(t *testing.T) {
 	}
 }
 
-func TestListMailboxesSkipsOnlyFolderRejectedByServer(t *testing.T) {
+func TestMailboxDiscoverySurvivesUnavailableStatistics(t *testing.T) {
+	t.Run("rejected status", func(t *testing.T) {
+		client := scriptedClient(t, imap.CapSet{imap.CapIMAP4rev1: {}, imap.CapStatusSize: {}}, []imapStep{
+			{" LIST ", "* LIST () \"/\" \"INBOX\"\r\n* LIST () \"/\" \"Deleted Items\"\r\n%s OK list complete\r\n"},
+			{` STATUS INBOX \(([A-Z]+ )*SIZE( [A-Z]+)*\)`, "%s BAD size unavailable\r\n"},
+			{` STATUS INBOX \((MESSAGES|UIDNEXT|UIDVALIDITY)( (MESSAGES|UIDNEXT|UIDVALIDITY))*\)`, "* STATUS INBOX (MESSAGES 2 UIDNEXT 3 UIDVALIDITY 1)\r\n%s OK status complete\r\n"},
+			{` STATUS "Deleted Items" \(([A-Z]+ )*SIZE( [A-Z]+)*\)`, "%s NO status unavailable\r\n"},
+			{` STATUS "Deleted Items" \((MESSAGES|UIDNEXT|UIDVALIDITY)( (MESSAGES|UIDNEXT|UIDVALIDITY))*\)`, "%s NO status unavailable\r\n"},
+		})
+		ctx := context.Background()
+		mailboxes, err := client.ListMailboxes(ctx)
+		if err != nil || len(mailboxes) != 2 {
+			t.Fatalf("LIST returned %#v, %v", mailboxes, err)
+		}
+		client.ReadMailboxStats(ctx, mailboxes)
+		inbox, deleted := mailboxes[0], mailboxes[1]
+		if !inbox.Selectable || inbox.MessagesUnknown || inbox.Messages != 2 || inbox.SizeKnown {
+			t.Fatalf("basic STATUS did not recover message count: %#v", inbox)
+		}
+		if deleted.Name != "Deleted Items" || !deleted.Selectable || !deleted.MessagesUnknown || deleted.SizeKnown {
+			t.Fatalf("failure reading statistics changed folder eligibility: %#v", deleted)
+		}
+	})
+
+	t.Run("LIST-STATUS disconnects", func(t *testing.T) {
+		client := scriptedClient(t, imap.CapSet{imap.CapIMAP4rev1: {}, imap.CapListStatus: {}, imap.CapStatusSize: {}}, []imapStep{
+			{" LIST ", "* LIST () \"/\" \"INBOX\"\r\n* LIST () \"/\" \"Deleted Items\"\r\n%s OK list complete\r\n"},
+			{`RETURN \(STATUS `, ""},
+		})
+		ctx := context.Background()
+		mailboxes, err := client.ListMailboxes(ctx)
+		if err != nil || len(mailboxes) != 2 {
+			t.Fatalf("LIST returned %#v, %v", mailboxes, err)
+		}
+		client.ReadMailboxStats(ctx, mailboxes)
+		for _, mailbox := range mailboxes {
+			if !mailbox.Selectable || !mailbox.MessagesUnknown || mailbox.SizeKnown {
+				t.Fatalf("connection loss during optional LIST-STATUS changed folder eligibility: %#v", mailbox)
+			}
+		}
+	})
+}
+
+func TestFetchMetadataRetriesWithoutRejectedSize(t *testing.T) {
+	client := scriptedClient(t, imap.CapSet{imap.CapIMAP4rev1: {}}, []imapStep{
+		{`RFC822\.SIZE`, "%s NO message size unavailable\r\n"},
+		{`\(UID (FLAGS INTERNALDATE|INTERNALDATE FLAGS) BODY\.PEEK\[HEADER\.FIELDS \("Message-ID"\)\]\)`, "* 1 FETCH (UID 5 FLAGS (\\Seen) INTERNALDATE \"01-Jan-2000 00:00:00 +0000\")\r\n%s OK fetch complete\r\n"},
+	})
+	metadata, err := client.FetchMetadata(context.Background(), 5)
+	if err != nil || metadata.UID != 5 || metadata.SizeKnown || metadata.InternalDate.IsZero() || !reflect.DeepEqual(metadata.Flags, []string{"\\Seen"}) {
+		t.Fatalf("FETCH without a size returned %#v, %v", metadata, err)
+	}
+}
+
+type imapStep struct {
+	command string
+	reply   string
+}
+
+func scriptedClient(t *testing.T, caps imap.CapSet, steps []imapStep) *realClient {
+	t.Helper()
 	clientConn, serverConn := net.Pipe()
+	_ = serverConn.SetDeadline(time.Now().Add(5 * time.Second))
 	serverError := make(chan error, 1)
 	go func() {
 		defer serverConn.Close()
-		if _, err := fmt.Fprint(serverConn, "* OK [CAPABILITY IMAP4rev1] ready\r\n"); err != nil {
-			serverError <- err
-			return
-		}
-		reader := bufio.NewReader(serverConn)
-		for index := 0; index < 5; index++ {
-			line, err := reader.ReadString('\n')
-			if err != nil {
-				serverError <- err
-				return
+		serverError <- func() error {
+			if _, err := fmt.Fprint(serverConn, "* OK [CAPABILITY IMAP4rev1] ready\r\n"); err != nil {
+				return err
 			}
-			tag := strings.Fields(line)[0]
-			switch index {
-			case 0:
-				_, err = fmt.Fprintf(serverConn, "* LIST () \"/\" \"INBOX\"\r\n* LIST () \"/\" \"Parent/Folder \"\r\n%s OK list complete\r\n", tag)
-			case 1:
-				_, err = fmt.Fprintf(serverConn, "* STATUS \"INBOX\" (MESSAGES 2 UIDNEXT 3 UIDVALIDITY 1)\r\n%s OK status complete\r\n", tag)
-			case 2:
-				_, err = fmt.Fprintf(serverConn, "%s BAD status unavailable\r\n", tag)
-			case 3:
-				_, err = fmt.Fprintf(serverConn, "%s BAD [READ-ONLY] EXAMINE unable to open folder index.\r\n", tag)
-			case 4:
-				_, err = fmt.Fprintf(serverConn, "%s NO folder index unavailable\r\n", tag)
+			reader := bufio.NewReader(serverConn)
+			for _, step := range steps {
+				line, err := reader.ReadString('\n')
+				if err != nil {
+					return err
+				}
+				if matched, err := regexp.MatchString(step.command, line); err != nil || !matched {
+					return fmt.Errorf("expected %q in command %q", step.command, line)
+				}
+				if step.reply == "" {
+					return nil
+				}
+				if _, err := fmt.Fprintf(serverConn, step.reply, strings.Fields(line)[0]); err != nil {
+					return err
+				}
 			}
-			if err != nil {
-				serverError <- err
-				return
-			}
-		}
+			return nil
+		}()
 	}()
-
-	protocolClient := imapclient.New(clientConn, nil)
-	client := &realClient{client: protocolClient, capabilities: imap.CapSet{imap.CapIMAP4rev1: {}}}
-	defer client.Close()
-	mailboxes, err := client.ListMailboxes(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(mailboxes) != 2 || mailboxes[0].Name != "INBOX" || !mailboxes[0].Selectable || mailboxes[0].Messages != 2 || mailboxes[1].Name != "Parent/Folder " || mailboxes[1].Selectable || mailboxes[1].UnavailableReason == "" {
-		t.Fatalf("unexpected unavailable mailbox: %#v", mailboxes)
-	}
-	select {
-	case err := <-serverError:
-		t.Fatal(err)
-	default:
-	}
+	client := &realClient{client: imapclient.New(clientConn, nil), capabilities: caps}
+	t.Cleanup(func() {
+		_ = client.Close()
+		if err := <-serverError; err != nil {
+			t.Error(err)
+		}
+	})
+	return client
 }
 
 func TestListMessageMetadataFetchesOnlyUIDAndSize(t *testing.T) {

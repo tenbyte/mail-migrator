@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Mail migrations can start when an IMAP server fails to report folder statistics or quota. The review screen shows which statistics are unknown and keeps the folders available for transfer.
+- Message transfers use the raw body when the server omits or reports zero for the message size. Duplicate protection and verification can also use the raw body when size metadata is unavailable.
+
 ## 0.7.1 - 2026-10-04
 
 ### Fixed

@@ -92,6 +92,7 @@ type Mailbox struct {
 	SpecialUse        string   `json:"specialUse,omitempty"`
 	Selectable        bool     `json:"selectable"`
 	Messages          uint32   `json:"messages"`
+	MessagesUnknown   bool     `json:"messagesUnknown,omitempty"`
 	UIDValidity       uint32   `json:"uidValidity"`
 	UIDNext           uint32   `json:"uidNext"`
 	Size              int64    `json:"size"`
@@ -114,6 +115,7 @@ type ServerSummary struct {
 	Mailboxes           []Mailbox `json:"mailboxes"`
 	FolderCount         int       `json:"folderCount"`
 	Messages            int64     `json:"messages"`
+	MessagesUnknown     bool      `json:"messagesUnknown,omitempty"`
 	Bytes               int64     `json:"bytes"`
 	BytesKnown          bool      `json:"bytesKnown"`
 	UIDPlus             bool      `json:"uidPlus"`

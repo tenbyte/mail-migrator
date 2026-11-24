@@ -9,6 +9,7 @@ import (
 	"hash"
 	"io"
 	"runtime/debug"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -39,6 +40,11 @@ type runControl struct {
 	cancel context.CancelFunc
 	paused atomic.Bool
 	notify chan struct{}
+}
+
+type folderJob struct {
+	database.FolderRecord
+	messagesUnknown bool
 }
 
 type runFailure struct {
@@ -86,13 +92,25 @@ func (s *Service) Inspect(ctx context.Context, account domain.AccountConfig) (do
 	if err != nil {
 		return domain.ServerSummary{}, err
 	}
+	// This connection is disposable once LIST succeeds. Bound the optional
+	// commands, including servers that never finish sending a reply.
+	statsCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	stopClosing := context.AfterFunc(statsCtx, func() { _ = client.Close() })
+	defer stopClosing()
+	client.ReadMailboxStats(statsCtx, mailboxes)
 	summary := summarize(account.Host, caps, mailboxes)
-	if limits, limitErr := client.Limits(ctx, limitMailbox(mailboxes)); limitErr == nil {
-		summary.AppendLimit = limits.AppendLimit
-		summary.QuotaAvailableBytes = limits.QuotaAvailableBytes
-		summary.QuotaUsedBytes = limits.QuotaUsedBytes
-	} else {
-		summary.Warnings = append(summary.Warnings, "IMAP quota could not be read; the transfer still checks server errors for each message.")
+	if mailbox := limitMailbox(mailboxes); mailbox != "" && slices.Contains(caps, "QUOTA") {
+		limits, limitErr := client.Limits(statsCtx, mailbox)
+		if limitErr == nil {
+			summary.QuotaAvailableBytes = limits.QuotaAvailableBytes
+			summary.QuotaUsedBytes = limits.QuotaUsedBytes
+		} else {
+			summary.Warnings = append(summary.Warnings, "IMAP quota could not be read. The transfer can still start and will report any messages the destination rejects.")
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return domain.ServerSummary{}, err
 	}
 	return summary, nil
 }
@@ -107,45 +125,6 @@ func (s *Service) Preflight(ctx context.Context, source, destination domain.Acco
 		err     error
 	}
 	results := make(chan sideResult, 2)
-	check := func(account domain.AccountConfig, sourceSide bool) {
-		client, err := s.factory.Connect(ctx, account, 15*time.Second, 90*time.Second)
-		if err != nil {
-			results <- sideResult{source: sourceSide, err: err}
-			return
-		}
-		defer client.Close()
-		caps, err := client.Capabilities(ctx)
-		if err != nil {
-			results <- sideResult{source: sourceSide, err: err}
-			return
-		}
-		mailboxes, err := client.ListMailboxes(ctx)
-		if err != nil {
-			results <- sideResult{source: sourceSide, err: err}
-			return
-		}
-		if sourceSide {
-			summary := summarize(account.Host, caps, mailboxes)
-			if limits, limitErr := client.Limits(ctx, limitMailbox(mailboxes)); limitErr == nil {
-				summary.AppendLimit = limits.AppendLimit
-				summary.QuotaAvailableBytes = limits.QuotaAvailableBytes
-				summary.QuotaUsedBytes = limits.QuotaUsedBytes
-			} else {
-				summary.Warnings = append(summary.Warnings, "IMAP quota could not be read; the transfer still checks server errors for each message.")
-			}
-			results <- sideResult{source: true, summary: summary}
-			return
-		}
-		summary := summarize(account.Host, caps, mailboxes)
-		if limits, limitErr := client.Limits(ctx, limitMailbox(mailboxes)); limitErr == nil {
-			summary.AppendLimit = limits.AppendLimit
-			summary.QuotaAvailableBytes = limits.QuotaAvailableBytes
-			summary.QuotaUsedBytes = limits.QuotaUsedBytes
-		} else {
-			summary.Warnings = append(summary.Warnings, "IMAP quota could not be read; the transfer still checks server errors for each message.")
-		}
-		results <- sideResult{source: sourceSide, summary: summary}
-	}
 	runCheck := func(account domain.AccountConfig, sourceSide bool) {
 		defer func() {
 			if recovered := recover(); recovered != nil {
@@ -155,7 +134,8 @@ func (s *Service) Preflight(ctx context.Context, source, destination domain.Acco
 				results <- sideResult{source: sourceSide, err: errors.New("internal error during mail preflight")}
 			}
 		}()
-		check(account, sourceSide)
+		summary, err := s.Inspect(ctx, account)
+		results <- sideResult{source: sourceSide, summary: summary, err: err}
 	}
 	go runCheck(source, true)
 	go runCheck(destination, false)
@@ -221,9 +201,10 @@ func summarize(host string, caps []string, mailboxes []domain.Mailbox) domain.Se
 			s.BytesKnown = false
 			unknownSize = true
 		}
+		s.MessagesUnknown = s.MessagesUnknown || box.MessagesUnknown
 	}
-	if unknownSize {
-		s.Warnings = append(s.Warnings, "The displayed byte total is incomplete because the server did not finish reporting every folder size. This does not exclude those folders or messages from migration.")
+	if unknownSize || s.MessagesUnknown {
+		s.Warnings = append(s.Warnings, "The server did not report complete folder statistics. Affected folders remain available for migration.")
 	}
 	for _, capability := range caps {
 		upper := strings.ToUpper(capability)
@@ -350,10 +331,14 @@ func (s *Service) run(ctx context.Context, id int64, request domain.StartRequest
 	}
 	lastFailure := &runFailure{}
 	totalMessages, totalBytes := int64(0), int64(0)
+	unknownCounts := make(map[string]bool)
 	for _, mapping := range request.Mappings {
 		if mapping.Enabled {
 			totalMessages += int64(mapping.Source.Messages)
 			totalBytes += mapping.Source.Size
+			if mapping.Source.MessagesUnknown {
+				unknownCounts[mapping.Source.Name] = true
+			}
 		}
 	}
 	if previous, previousErr := s.db.RecentByID(ctx, id); previousErr == nil {
@@ -413,7 +398,7 @@ func (s *Service) run(ctx context.Context, id int64, request domain.StartRequest
 		runIndeterminate.Store(false)
 		emit("Reconciling source and destination", 0, domain.MigrationRunning, "")
 	}
-	jobs := make(chan database.FolderRecord)
+	jobs := make(chan folderJob)
 	duplicateIndexes := &duplicateIndexCache{indexes: make(map[string]*duplicateIndex)}
 	var wg sync.WaitGroup
 	var workerPanicked atomic.Bool
@@ -439,7 +424,7 @@ dispatch:
 			continue
 		}
 		select {
-		case jobs <- folder:
+		case jobs <- folderJob{FolderRecord: folder, messagesUnknown: unknownCounts[folder.SourceName]}:
 		case <-ctx.Done():
 			break dispatch
 		}
@@ -465,6 +450,10 @@ dispatch:
 	}
 	message := lastFailure.get()
 	runItemsDone.Store(runItemsTotal.Load())
+	if request.Mode != "reconcile" {
+		// The actual transfer can exceed the estimates when statistics are incomplete.
+		_ = s.db.UpdateServiceCurrent(ctx, id, domain.ServiceMail, "", max(runItemsTotal.Load(), copiedMessages.Load()), max(totalBytes, copiedBytes.Load()))
+	}
 	_ = s.db.MarkMigration(context.Background(), id, state, message)
 	emit("", 0, state, message)
 }
@@ -603,11 +592,11 @@ func (writer *canonicalLineEndingHasher) sum() string {
 	return hex.EncodeToString(writer.hash.Sum(nil))
 }
 
-func hashSelectedMessageDigests(ctx context.Context, client mailimap.Client, uid uint32, sizeKnown, includeCanonical bool) (messageDigests, error) {
+func hashSelectedMessageDigests(ctx context.Context, client mailimap.Client, uid uint32, allowEmpty, includeCanonical bool) (messageDigests, error) {
 	var digests messageDigests
 	err := client.StreamMessage(ctx, uid, func(reader io.Reader, size int64) error {
 		digests.size = size
-		if size == 0 && !sizeKnown {
+		if size == 0 && !allowEmpty {
 			return issue(domain.MessageQuarantined, "TB-MAIL-SOURCE-EMPTY", "The source returned an empty message.")
 		}
 		exact := sha256.New()
@@ -642,21 +631,25 @@ func hashSelectedMessageDigests(ctx context.Context, client mailimap.Client, uid
 	return digests, nil
 }
 
-func hashSelectedMessage(ctx context.Context, client mailimap.Client, uid uint32, _ int64, sizeKnown bool) (string, int64, error) {
-	digests, err := hashSelectedMessageDigests(ctx, client, uid, sizeKnown, false)
+func hashSelectedMessage(ctx context.Context, client mailimap.Client, uid uint32, allowEmpty bool) (string, int64, error) {
+	digests, err := hashSelectedMessageDigests(ctx, client, uid, allowEmpty, false)
 	return digests.exact, digests.size, err
 }
 
 func verifyDestinationMessage(ctx context.Context, client mailimap.Client, uid uint32, expectedSize int64, sourceSHA, sourceCanonicalSHA string, fullHash bool) (string, error) {
-	meta, err := client.FetchMetadata(ctx, uid)
-	if err != nil {
-		return "", issue(domain.MessageFailed, "TB-MAIL-VERIFY-MISSING", "The newly stored destination message could not be opened again.")
-	}
 	if !fullHash {
-		if meta.SizeKnown && meta.Size != expectedSize {
-			return "", issue(domain.MessageFailed, "TB-MAIL-VERIFY-SIZE", fmt.Sprintf("The destination reports %d instead of %d bytes.", meta.Size, expectedSize))
+		meta, err := client.FetchMetadata(ctx, uid)
+		if err != nil {
+			return "", issue(domain.MessageFailed, "TB-MAIL-VERIFY-MISSING", "The newly stored destination message could not be opened again.")
 		}
-		return "", nil
+		if meta.SizeKnown && meta.Size > 0 {
+			if meta.Size != expectedSize {
+				return "", issue(domain.MessageFailed, "TB-MAIL-VERIFY-SIZE", fmt.Sprintf("The destination reports %d instead of %d bytes.", meta.Size, expectedSize))
+			}
+			return "", nil
+		}
+		// A missing size cannot verify even a metadata-only transfer.
+		// Fall through to verification against the actual body.
 	}
 	destination, err := hashSelectedMessageDigests(ctx, client, uid, true, sourceCanonicalSHA != "")
 	if err != nil {
@@ -685,10 +678,10 @@ func matchingDestinationUIDs(ctx context.Context, client mailimap.Client, after 
 	matches := make([]uint32, 0, 1)
 	for _, uid := range uids {
 		meta, err := client.FetchMetadata(ctx, uid)
-		if err != nil || (meta.SizeKnown && meta.Size != expectedSize) {
+		if err != nil || (meta.SizeKnown && meta.Size > 0 && meta.Size != expectedSize) {
 			continue
 		}
-		digest, size, err := hashSelectedMessage(ctx, client, uid, expectedSize, true)
+		digest, size, err := hashSelectedMessage(ctx, client, uid, true)
 		if err == nil && size == expectedSize && digest == sourceSHA {
 			matches = append(matches, uid)
 		}
@@ -736,11 +729,17 @@ func newDuplicateIndex(ctx context.Context, client mailimap.Client, mailbox stri
 	}
 	index := &duplicateIndex{bySize: make(map[int64][]*duplicateCandidate)}
 	for _, message := range metadata {
-		if !message.SizeKnown {
-			return nil, fmt.Errorf("destination folder %q reports a message without a size", mailbox)
-		}
 		candidate := &duplicateCandidate{uid: message.UID, size: message.Size}
-		index.bySize[message.Size] = append(index.bySize[message.Size], candidate)
+		if !message.SizeKnown || message.Size == 0 {
+			digests, err := hashSelectedMessageDigests(ctx, client, message.UID, true, false)
+			if err != nil {
+				return nil, fmt.Errorf("read destination message UID %d for duplicate protection: %w", message.UID, err)
+			}
+			candidate.size = digests.size
+			candidate.digest = digests.exact
+			candidate.hashed = true
+		}
+		index.bySize[candidate.size] = append(index.bySize[candidate.size], candidate)
 	}
 	return index, nil
 }
@@ -770,15 +769,15 @@ func (index *duplicateIndex) addConsumed(uid uint32, size int64, digest string) 
 	index.bySize[size] = append(index.bySize[size], &duplicateCandidate{uid: uid, size: size, digest: digest, hashed: digest != "", used: true})
 }
 
-func (index *duplicateIndex) findExact(ctx context.Context, source, destination mailimap.Client, sourceUID uint32, metadata mailimap.MessageMetadata) (uint32, string, int64, bool, error) {
+func (index *duplicateIndex) findExact(ctx context.Context, source, destination mailimap.Client, sourceUID uint32, allowEmpty bool) (uint32, string, int64, bool, error) {
 	if index == nil {
-		return 0, "", metadata.Size, false, nil
+		return 0, "", 0, false, nil
 	}
 
 	// RFC822.SIZE is only a hint on some legacy IMAP servers. Read the source
 	// literal first so the duplicate lookup uses the bytes that would actually
 	// be transferred.
-	sourceSHA, sourceSize, err := hashSelectedMessage(ctx, source, sourceUID, metadata.Size, metadata.SizeKnown)
+	sourceSHA, sourceSize, err := hashSelectedMessage(ctx, source, sourceUID, allowEmpty)
 	if err != nil {
 		return 0, "", sourceSize, false, err
 	}
@@ -787,19 +786,21 @@ func (index *duplicateIndex) findExact(ctx context.Context, source, destination 
 	defer index.mu.Unlock()
 	candidates := index.bySize[sourceSize]
 	for _, candidate := range candidates {
-		if candidate.used {
+		if candidate.used || candidate.size != sourceSize {
 			continue
 		}
 		if !candidate.hashed {
-			digest, size, hashErr := hashSelectedMessage(ctx, destination, candidate.uid, candidate.size, true)
-			if hashErr != nil || size != candidate.size {
-				if hashErr == nil {
-					hashErr = fmt.Errorf("destination message UID %d returned %d instead of %d bytes", candidate.uid, size, candidate.size)
-				}
+			digest, size, hashErr := hashSelectedMessage(ctx, destination, candidate.uid, true)
+			if hashErr != nil {
 				return 0, sourceSHA, sourceSize, false, fmt.Errorf("read destination message UID %d for duplicate protection: %v", candidate.uid, hashErr)
 			}
 			candidate.digest = digest
 			candidate.hashed = true
+			if size != candidate.size {
+				candidate.size = size
+				index.bySize[size] = append(index.bySize[size], candidate)
+				continue
+			}
 		}
 		if candidate.digest == sourceSHA {
 			candidate.used = true
@@ -841,7 +842,7 @@ func (s *Service) recordFolderFailure(id int64, request domain.StartRequest, fol
 	emit(folderName, 0, domain.MigrationRunning, "["+code+"] "+message)
 }
 
-func (s *Service) worker(ctx context.Context, id int64, request domain.StartRequest, control *runControl, jobs <-chan database.FolderRecord, duplicateIndexes *duplicateIndexCache, noticeMessageIDs map[string]struct{}, copiedBytes, copiedMessages, failedMessages, runItemsTotal, runItemsDone *atomic.Int64, lastFailure *runFailure, emit emitFunc) {
+func (s *Service) worker(ctx context.Context, id int64, request domain.StartRequest, control *runControl, jobs <-chan folderJob, duplicateIndexes *duplicateIndexCache, noticeMessageIDs map[string]struct{}, copiedBytes, copiedMessages, failedMessages, runItemsTotal, runItemsDone *atomic.Int64, lastFailure *runFailure, emit emitFunc) {
 	connect := func() (mailimap.Client, mailimap.Client, error) {
 		timeout := time.Duration(request.Options.ConnectionTimeout) * time.Second
 		stall := time.Duration(request.Options.StallTimeout) * time.Second
@@ -917,7 +918,7 @@ func (s *Service) worker(ctx context.Context, id int64, request domain.StartRequ
 			emit("Reconciliation: "+folder.SourceName, 0, domain.MigrationRunning, "")
 			sourceUIDs, err = src.SearchUIDs(ctx, 0)
 			if err == nil {
-				err = s.reconcileFolder(ctx, id, request, folder, uidValidity, destinationUIDValidity, sourceUIDs, dst, copiedBytes, copiedMessages, runItemsDone)
+				err = s.reconcileFolder(ctx, id, request, folder.FolderRecord, uidValidity, destinationUIDValidity, sourceUIDs, dst, copiedBytes, copiedMessages, runItemsDone)
 			}
 			// Candidate reconciliation may select the mailbox read-only. Restore
 			// the writable destination selection and its permanent flags.
@@ -944,6 +945,8 @@ func (s *Service) worker(ctx context.Context, id int64, request domain.StartRequ
 		uids = mergeUIDs(unfinished, uids)
 		if request.Mode == "reconcile" {
 			runItemsTotal.Add(int64(len(uids)))
+		} else if folder.messagesUnknown {
+			runItemsTotal.Add(int64(len(sourceUIDs)))
 		}
 		for _, uid := range uids {
 			if !waitRunning(ctx, control) {
@@ -965,7 +968,7 @@ func (s *Service) worker(ctx context.Context, id int64, request domain.StartRequ
 				continue
 			}
 			if _, generated := noticeMessageIDs[strings.ToLower(strings.TrimSpace(meta.MessageID))]; generated {
-				if request.Mode == "reconcile" {
+				if request.Mode == "reconcile" || folder.messagesUnknown {
 					runItemsDone.Add(-1)
 					runItemsTotal.Add(-1)
 				}
@@ -977,19 +980,11 @@ func (s *Service) worker(ctx context.Context, id int64, request domain.StartRequ
 			if (existing.State == domain.MessageQuarantined || existing.State == domain.MessageFailed || existing.State == domain.MessageSkipped) && existing.PolicyOverride == "" {
 				continue
 			}
-			if meta.SizeKnown && meta.Size == 0 && !forceEmpty {
-				message := "The source reports RFC822.SIZE 0. The message was quarantined and not transferred."
-				_ = s.db.RecordMessageIssue(ctx, id, folder.ID, uidValidity, uid, 0, "", meta.InternalDate, domain.MessageQuarantined, "TB-MAIL-SOURCE-EMPTY", message)
-				failedMessages.Add(1)
-				emit(folder.SourceName, uid, domain.MigrationRunning, "[TB-MAIL-SOURCE-EMPTY] "+message)
-				continue
-			}
 			if existing.State == domain.MessageUnknown {
 				sourceSHA := existing.SourceSHA
 				sourceSize := meta.Size
-				if sourceSHA == "" {
-					var sourceErr error
-					sourceSHA, sourceSize, sourceErr = hashSelectedMessage(ctx, src, uid, meta.Size, meta.SizeKnown)
+				if sourceSHA == "" || !meta.SizeKnown || sourceSize == 0 {
+					digest, size, sourceErr := hashSelectedMessage(ctx, src, uid, forceEmpty)
 					if sourceErr != nil {
 						var typed *mailIssueError
 						if errors.As(sourceErr, &typed) {
@@ -998,6 +993,11 @@ func (s *Service) worker(ctx context.Context, id int64, request domain.StartRequ
 						emit(folder.SourceName, uid, domain.MigrationRunning, "[TB-MAIL-TARGET-APPEND-UNKNOWN] The message with an unknown outcome could not be checked safely against the destination.")
 						continue
 					}
+					if sourceSHA != "" && sourceSHA != digest {
+						emit(folder.SourceName, uid, domain.MigrationRunning, "[TB-MAIL-TARGET-APPEND-UNKNOWN] The source changed after the previous APPEND. No additional copy was created.")
+						continue
+					}
+					sourceSHA, sourceSize = digest, size
 					_ = s.db.SetMessageTransferIdentity(ctx, id, folder.ID, uid, sourceSHA, existing.PreAppendUIDNext)
 					_ = s.db.FailMessageCode(ctx, id, folder.ID, uid, domain.MessageUnknown, "TB-MAIL-TARGET-APPEND-UNKNOWN", "The APPEND outcome continues to be checked only at the destination.")
 				}
@@ -1030,7 +1030,7 @@ func (s *Service) worker(ctx context.Context, id int64, request domain.StartRequ
 				_ = s.db.AddMessageWarning(ctx, id, folder.ID, uid, "TB-MAIL-SOURCE-NO-MESSAGE-ID", "The message has no usable Message-ID.")
 			}
 			if existing.PolicyOverride == string(domain.MailIssueVerifyAgain) {
-				source, sourceErr := hashSelectedMessageDigests(ctx, src, uid, meta.SizeKnown, true)
+				source, sourceErr := hashSelectedMessageDigests(ctx, src, uid, true, true)
 				if sourceErr != nil || (existing.SourceSHA != "" && source.exact != existing.SourceSHA) {
 					message := "The source message changed since the destination copy was created; verification was not approved."
 					_ = s.db.FailMessageCode(ctx, id, folder.ID, uid, domain.MessageFailed, "TB-MAIL-VERIFY-SOURCE-CHANGED", message)
@@ -1055,7 +1055,7 @@ func (s *Service) worker(ctx context.Context, id int64, request domain.StartRequ
 				continue
 			}
 			if request.Options.DuplicateProtection {
-				candidateUID, sourceSHA, sourceSize, found, duplicateErr := duplicates.findExact(ctx, src, dst, uid, meta)
+				candidateUID, sourceSHA, sourceSize, found, duplicateErr := duplicates.findExact(ctx, src, dst, uid, forceEmpty)
 				if duplicateErr != nil {
 					var typed *mailIssueError
 					if errors.As(duplicateErr, &typed) {
@@ -1152,9 +1152,6 @@ func (s *Service) worker(ctx context.Context, id int64, request domain.StartRequ
 					if limits.AppendLimit > 0 && size > limits.AppendLimit {
 						return issue(domain.MessageQuarantined, "TB-MAIL-TARGET-APPEND-LIMIT", fmt.Sprintf("The message is %d bytes, which exceeds the APPENDLIMIT of %d bytes.", size, limits.AppendLimit))
 					}
-					if limits.QuotaAvailableBytes > 0 && size > limits.QuotaAvailableBytes {
-						return issue(domain.MessageFailed, "TB-MAIL-TARGET-QUOTA", "The free storage reported by the destination is insufficient for this message.")
-					}
 					appendMeta.Size = size
 					hash := sha256.New()
 					var canonical *canonicalLineEndingHasher
@@ -1227,7 +1224,7 @@ func (s *Service) worker(ctx context.Context, id int64, request domain.StartRequ
 						transferErr = verifyErr
 					} else {
 						verification := "metadata"
-						if fullHash {
+						if destinationSHA != "" {
 							verification = "verified"
 						}
 						if completeErr := s.db.CompleteVerifiedMessage(ctx, id, folder.ID, uidValidity, uid, appendResult.UID, actualSize, sha, destinationSHA, verification); completeErr != nil {
@@ -1259,9 +1256,6 @@ func (s *Service) worker(ctx context.Context, id int64, request domain.StartRequ
 			copiedMessages.Add(1)
 			copiedBytes.Add(transferredSize)
 			duplicates.addConsumed(appendResult.UID, transferredSize, sha)
-			if limits.QuotaAvailableBytes > transferredSize {
-				limits.QuotaAvailableBytes -= transferredSize
-			}
 		}
 	}
 }

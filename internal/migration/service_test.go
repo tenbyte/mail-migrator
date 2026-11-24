@@ -24,6 +24,8 @@ type reconciliationClient struct {
 	metadata      map[uint32]mailimap.MessageMetadata
 	metadataCalls int
 	keywordCalls  int
+	capabilities  []string
+	quotaErr      error
 	candidates    map[string]mailimap.Candidate
 	mailboxes     []domain.Mailbox
 	listResponses [][]domain.Mailbox
@@ -36,7 +38,9 @@ type reconciliationClient struct {
 	uidValidity   uint32
 }
 
-func (c *reconciliationClient) Capabilities(context.Context) ([]string, error) { return nil, nil }
+func (c *reconciliationClient) Capabilities(context.Context) ([]string, error) {
+	return c.capabilities, nil
+}
 func (c *reconciliationClient) ListMailboxes(context.Context) ([]domain.Mailbox, error) {
 	if len(c.listResponses) > 0 {
 		index := min(c.listCalls, len(c.listResponses)-1)
@@ -46,6 +50,7 @@ func (c *reconciliationClient) ListMailboxes(context.Context) ([]domain.Mailbox,
 	c.listCalls++
 	return c.mailboxes, nil
 }
+func (c *reconciliationClient) ReadMailboxStats(context.Context, []domain.Mailbox) {}
 func (c *reconciliationClient) SelectMailbox(context.Context, string, bool) (uint32, uint32, []string, error) {
 	return c.uidValidity, 0, nil, nil
 }
@@ -104,7 +109,10 @@ func (c *reconciliationClient) CreateMailbox(_ context.Context, name string) err
 	c.createCalls = append(c.createCalls, name)
 	return c.createErrors[name]
 }
-func (c *reconciliationClient) Limits(context.Context, string) (mailimap.MailboxLimits, error) {
+func (c *reconciliationClient) Limits(_ context.Context, mailbox string) (mailimap.MailboxLimits, error) {
+	if mailbox != "" {
+		return mailimap.MailboxLimits{}, c.quotaErr
+	}
 	return mailimap.MailboxLimits{}, nil
 }
 func (c *reconciliationClient) Close() error { return nil }
@@ -332,17 +340,17 @@ func TestHashSelectedMessageQuarantinesEmptyAndTruncatedLiteral(t *testing.T) {
 		raw:          map[uint32][]byte{1: {}, 2: []byte("abc"), 3: []byte("abc")},
 		literalSizes: map[uint32]int64{3: 4},
 	}
-	_, _, err := hashSelectedMessage(context.Background(), client, 1, 0, false)
+	_, _, err := hashSelectedMessage(context.Background(), client, 1, false)
 	var mailIssue *mailIssueError
 	if !errors.As(err, &mailIssue) || mailIssue.code != "TB-MAIL-SOURCE-EMPTY" || mailIssue.state != domain.MessageQuarantined {
 		t.Fatalf("empty source was not quarantined: %v", err)
 	}
-	_, _, err = hashSelectedMessage(context.Background(), client, 3, 3, true)
+	_, _, err = hashSelectedMessage(context.Background(), client, 3, true)
 	if !errors.As(err, &mailIssue) || mailIssue.code != "TB-MAIL-SOURCE-SIZE-MISMATCH" {
 		t.Fatalf("truncated literal was not quarantined: %v", err)
 	}
 
-	digest, size, err := hashSelectedMessage(context.Background(), client, 2, 4, true)
+	digest, size, err := hashSelectedMessage(context.Background(), client, 2, true)
 	if err != nil || size != 3 || digest == "" {
 		t.Fatalf("RFC822.SIZE mismatch was incorrectly rejected: digest=%q size=%d err=%v", digest, size, err)
 	}
@@ -351,7 +359,7 @@ func TestHashSelectedMessageQuarantinesEmptyAndTruncatedLiteral(t *testing.T) {
 func TestHashSelectedMessagePreservesNonStandardRawBytes(t *testing.T) {
 	raw := append([]byte("Subject: =?broken?\r\n\r\n中文"), 0, 1, 2)
 	client := &reconciliationClient{raw: map[uint32][]byte{7: raw}}
-	digest, size, err := hashSelectedMessage(context.Background(), client, 7, int64(len(raw)), true)
+	digest, size, err := hashSelectedMessage(context.Background(), client, 7, true)
 	if err != nil || size != int64(len(raw)) || digest == "" {
 		t.Fatalf("non-standard raw message was not hashed byte-exactly: digest=%q size=%d err=%v", digest, size, err)
 	}
@@ -429,6 +437,77 @@ func TestPreflightDoesNotInventoryMessages(t *testing.T) {
 	}
 }
 
+type transferDestination struct{ reconciliationClient }
+
+func (c *transferDestination) AppendMessage(_ context.Context, _ string, meta mailimap.MessageMetadata, reader io.Reader, _, _ []string) (mailimap.AppendResult, error) {
+	body, err := io.ReadAll(reader)
+	if err != nil {
+		return mailimap.AppendResult{}, err
+	}
+	if int64(len(body)) != meta.Size {
+		return mailimap.AppendResult{}, errors.New("incorrect APPEND literal size")
+	}
+	c.raw[102] = body
+	return mailimap.AppendResult{UID: 102}, nil
+}
+
+func TestMigrationCompletesWithoutFolderStatisticsOrQuota(t *testing.T) {
+	ctx := context.Background()
+	db, err := database.Open(filepath.Join(t.TempDir(), "migration.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	body := []byte("X-Test: true\r\n\r\n")
+	mailboxes := []domain.Mailbox{{Name: "INBOX", Selectable: true, MessagesUnknown: true}}
+	source := &reconciliationClient{
+		mailboxes: mailboxes, uids: []uint32{1}, uidValidity: 1,
+		metadata: map[uint32]mailimap.MessageMetadata{1: {UID: 1, SizeKnown: true}},
+		raw:      map[uint32][]byte{1: body},
+	}
+	destination := &transferDestination{reconciliationClient{
+		mailboxes: mailboxes, uids: []uint32{101}, uidValidity: 1,
+		capabilities: []string{"QUOTA"}, quotaErr: errors.New("quota unavailable"),
+		metadata: map[uint32]mailimap.MessageMetadata{101: {UID: 101}},
+		raw:      map[uint32][]byte{101: []byte("X-Test: existing\r\n\r\n")},
+	}}
+	finished := make(chan domain.Progress, 1)
+	service := New(db, hostFactory{"source": source, "destination": destination}, func(progress domain.Progress) {
+		if progress.State != domain.MigrationRunning {
+			finished <- progress
+		}
+	})
+	request := domain.StartRequest{Source: domain.AccountConfig{Host: "source"}, Destination: domain.AccountConfig{Host: "destination"}, Options: domain.DefaultTransferOptions()}
+	request.Options.Concurrency = 1
+	preflight, err := service.Preflight(ctx, request.Source, request.Destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(preflight.Mappings) != 1 || !preflight.Mappings[0].Enabled || !preflight.Mappings[0].DestinationExists || !preflight.Source.MessagesUnknown || preflight.Source.BytesKnown {
+		t.Fatalf("unexpected preflight: %#v", preflight)
+	}
+	if !strings.Contains(strings.Join(preflight.Warnings, "\n"), "IMAP quota could not be read") {
+		t.Fatalf("missing quota warning: %v", preflight.Warnings)
+	}
+	request.Mappings = preflight.Mappings
+	id, err := service.Start(ctx, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case progress := <-finished:
+		if progress.State != domain.MigrationCompleted || progress.MessagesCopied != 1 || progress.RunItemsTotal != 1 || !bytes.Equal(destination.raw[102], body) {
+			t.Fatalf("migration did not copy and verify the message: %#v", progress)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("migration did not complete")
+	}
+	summary, err := db.RecentByID(ctx, id)
+	if err != nil || summary.MessagesTotal != 1 || summary.BytesTotal != int64(len(body)) {
+		t.Fatalf("missing transfer totals: %#v, %v", summary, err)
+	}
+}
+
 func TestSummarizeWarnsAndExcludesUnavailableWhitespaceFolder(t *testing.T) {
 	mailboxes := []domain.Mailbox{
 		{Name: "INBOX", Selectable: true, Messages: 2, Size: 35, SizeKnown: true},
@@ -449,7 +528,7 @@ func TestExactDuplicateIndexPreservesMultiplicityWithoutMessageID(t *testing.T) 
 		uids: []uint32{101, 102},
 		metadata: map[uint32]mailimap.MessageMetadata{
 			101: {UID: 101, Size: int64(len(raw)), SizeKnown: true},
-			102: {UID: 102, Size: int64(len(raw)), SizeKnown: true},
+			102: {UID: 102},
 		},
 		raw: map[uint32][]byte{101: raw, 102: raw},
 	}
@@ -458,16 +537,15 @@ func TestExactDuplicateIndexPreservesMultiplicityWithoutMessageID(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	meta := mailimap.MessageMetadata{Size: int64(len(raw)) - 1, SizeKnown: true}
-	first, _, _, found, err := index.findExact(context.Background(), source, destination, 1, meta)
+	first, _, _, found, err := index.findExact(context.Background(), source, destination, 1, false)
 	if err != nil || !found || first != 101 {
 		t.Fatalf("first match uid=%d found=%v err=%v", first, found, err)
 	}
-	second, _, _, found, err := index.findExact(context.Background(), source, destination, 2, meta)
+	second, _, _, found, err := index.findExact(context.Background(), source, destination, 2, false)
 	if err != nil || !found || second != 102 {
 		t.Fatalf("second match uid=%d found=%v err=%v", second, found, err)
 	}
-	_, _, _, found, err = index.findExact(context.Background(), source, destination, 3, meta)
+	_, _, _, found, err = index.findExact(context.Background(), source, destination, 3, false)
 	if err != nil || found {
 		t.Fatalf("one target copy was reused twice: found=%v err=%v", found, err)
 	}
@@ -481,7 +559,7 @@ func TestExactDuplicateIndexComparesRawBytesAndFailsClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _, _, found, err := index.findExact(context.Background(), source, destination, 1, mailimap.MessageMetadata{Size: 3, SizeKnown: true})
+	_, _, _, found, err := index.findExact(context.Background(), source, destination, 1, false)
 	if err != nil || found {
 		t.Fatalf("different raw content was deduplicated: found=%v err=%v", found, err)
 	}
@@ -491,9 +569,29 @@ func TestExactDuplicateIndexComparesRawBytesAndFailsClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _, _, _, err = index.findExact(context.Background(), source, brokenDestination, 1, mailimap.MessageMetadata{Size: 3, SizeKnown: true})
+	_, _, _, _, err = index.findExact(context.Background(), source, brokenDestination, 1, false)
 	if err == nil {
 		t.Fatal("unreadable target candidate did not fail closed")
+	}
+}
+
+func TestExactDuplicateIndexRecoversFromIncorrectDestinationSize(t *testing.T) {
+	destination := &reconciliationClient{
+		uids:     []uint32{9},
+		metadata: map[uint32]mailimap.MessageMetadata{9: {UID: 9, Size: 3, SizeKnown: true}},
+		raw:      map[uint32][]byte{9: []byte("body")},
+	}
+	source := &reconciliationClient{raw: map[uint32][]byte{1: []byte("abc"), 2: []byte("body")}}
+	ctx := context.Background()
+	index, err := newDuplicateIndex(ctx, destination, "INBOX")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, found, err := index.findExact(ctx, source, destination, 1, false); err != nil || found {
+		t.Fatalf("incorrectly advertised size prevented a normal transfer: found=%v err=%v", found, err)
+	}
+	if uid, _, _, found, err := index.findExact(ctx, source, destination, 2, false); err != nil || !found || uid != 9 {
+		t.Fatalf("actual size did not identify the duplicate: uid=%d found=%v err=%v", uid, found, err)
 	}
 }
 

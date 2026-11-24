@@ -76,6 +76,7 @@ type MessageSummary struct {
 type Client interface {
 	Capabilities(context.Context) ([]string, error)
 	ListMailboxes(context.Context) ([]domain.Mailbox, error)
+	ReadMailboxStats(context.Context, []domain.Mailbox)
 	SelectMailbox(context.Context, string, bool) (uidValidity, uidNext uint32, permanentFlags []string, err error)
 	SearchUIDs(context.Context, uint32) ([]uint32, error)
 	FetchMetadata(context.Context, uint32) (MessageMetadata, error)
@@ -95,9 +96,8 @@ type Factory interface {
 	Connect(context.Context, domain.AccountConfig, time.Duration, time.Duration) (Client, error)
 }
 
-// IsMailboxUnavailable reports a server rejection that is scoped to one
-// mailbox. Transport and cancellation errors must still abort the operation.
-func IsMailboxUnavailable(err error) bool {
+// isCommandRejected distinguishes a tagged command rejection from a broken connection.
+func isCommandRejected(err error) bool {
 	var imapErr *imap.Error
 	return errors.As(err, &imapErr) && (imapErr.Type == imap.StatusResponseTypeNo || imapErr.Type == imap.StatusResponseTypeBad)
 }
@@ -308,23 +308,13 @@ func (c *realClient) ListMailboxes(ctx context.Context) ([]domain.Mailbox, error
 	if err != nil {
 		return nil, err
 	}
-	statusOpts := &imap.StatusOptions{NumMessages: true, UIDNext: true, UIDValidity: true, Size: caps.Has(imap.CapStatusSize)}
 	var opts *imap.ListOptions
 	if caps.Has(imap.CapListExtended) || caps.Has(imap.CapIMAP4rev2) {
 		opts = &imap.ListOptions{ReturnChildren: true, ReturnSpecialUse: caps.Has(imap.CapSpecialUse)}
 	}
-	if caps.Has(imap.CapListStatus) || caps.Has(imap.CapIMAP4rev2) {
-		if opts == nil {
-			opts = &imap.ListOptions{}
-		}
-		opts.ReturnStatus = statusOpts
-	}
 	items, err := c.client.List("", "*", opts).Collect()
-	if err != nil && opts != nil && opts.ReturnStatus != nil {
-		// A few nominal LIST-STATUS implementations reject RETURN STATUS. The
-		// tagged BAD leaves the connection usable, so retry with classic LIST.
-		opts.ReturnStatus = nil
-		items, err = c.client.List("", "*", opts).Collect()
+	if isCommandRejected(err) && opts != nil {
+		items, err = c.client.List("", "*", nil).Collect()
 	}
 	if err != nil {
 		return nil, fmt.Errorf("list mailboxes: %w", err)
@@ -336,47 +326,74 @@ func (c *realClient) ListMailboxes(ctx context.Context) ([]domain.Mailbox, error
 			attrs[i] = string(a)
 		}
 		box := domain.Mailbox{Name: item.Mailbox, Delimiter: item.Delim, Attributes: attrs, SpecialUse: folders.SpecialUse(attrs), Selectable: !hasAttr(item.Attrs, imap.MailboxAttrNoSelect) && !hasAttr(item.Attrs, imap.MailboxAttrNonExistent)}
-		if box.Selectable {
-			status := item.Status
-			var statusErr error
-			if status == nil {
-				status, statusErr = c.client.Status(box.Name, statusOpts).Wait()
-			}
-			if statusErr != nil {
-				uidValidity, uidNext, _, selectErr := c.SelectMailbox(ctx, box.Name, true)
-				if selectErr != nil {
-					if IsMailboxUnavailable(selectErr) {
-						box.Selectable = false
-						box.UnavailableReason = fmt.Sprintf("the IMAP server cannot open this folder (%v)", selectErr)
-						result = append(result, box)
-						continue
-					}
-					return nil, fmt.Errorf("read status for %q: %w (EXAMINE fallback: %v)", box.Name, statusErr, selectErr)
-				}
-				box.Messages = c.selectedSize
-				box.UIDNext = uidNext
-				box.UIDValidity = uidValidity
-				if box.Messages == 0 {
-					box.SizeKnown = true
-				}
-				result = append(result, box)
-				continue
-			}
-			if status.NumMessages != nil {
-				box.Messages = *status.NumMessages
-			}
-			box.UIDNext = uint32(status.UIDNext)
-			box.UIDValidity = status.UIDValidity
-			if status.Size != nil {
-				box.Size = *status.Size
-				box.SizeKnown = true
-			} else if box.Messages == 0 {
-				box.SizeKnown = true
-			}
-		}
+		box.MessagesUnknown = box.Selectable
 		result = append(result, box)
 	}
 	return result, nil
+}
+
+// ReadMailboxStats enriches a successful LIST without changing folder eligibility.
+func (c *realClient) ReadMailboxStats(ctx context.Context, mailboxes []domain.Mailbox) {
+	if ctx.Err() != nil || len(mailboxes) == 0 {
+		return
+	}
+	caps, err := c.ensureCapabilities()
+	if err != nil {
+		return
+	}
+	basic := imap.StatusOptions{NumMessages: true, UIDNext: true, UIDValidity: true}
+	withSize := basic
+	withSize.Size = caps.Has(imap.CapStatusSize)
+
+	statuses := make(map[string]*imap.StatusData)
+	if caps.Has(imap.CapListStatus) || caps.Has(imap.CapIMAP4rev2) {
+		items, listErr := c.client.List("", "*", &imap.ListOptions{ReturnStatus: &withSize}).Collect()
+		for _, item := range items {
+			if item.Status != nil {
+				statuses[item.Mailbox] = item.Status
+			}
+		}
+		if isCommandRejected(listErr) {
+			// Retry per folder. A tagged rejection leaves the session usable.
+			clear(statuses)
+		}
+	}
+	for i := range mailboxes {
+		box := &mailboxes[i]
+		if !box.Selectable {
+			continue
+		}
+		status := statuses[box.Name]
+		if status == nil && ctx.Err() == nil {
+			select {
+			case <-c.client.Closed():
+				continue
+			default:
+			}
+			status, err = c.client.Status(box.Name, &withSize).Wait()
+			if withSize.Size && isCommandRejected(err) && ctx.Err() == nil {
+				status, err = c.client.Status(box.Name, &basic).Wait()
+			}
+			if err != nil {
+				continue
+			}
+		}
+		if status == nil {
+			continue
+		}
+		if status.NumMessages != nil {
+			box.Messages = *status.NumMessages
+			box.MessagesUnknown = false
+		}
+		box.UIDNext = uint32(status.UIDNext)
+		box.UIDValidity = status.UIDValidity
+		if status.Size != nil && *status.Size >= 0 {
+			box.Size = *status.Size
+			box.SizeKnown = true
+		} else if !box.MessagesUnknown && box.Messages == 0 {
+			box.SizeKnown = true
+		}
+	}
 }
 
 func (c *realClient) FetchSummary(ctx context.Context, uid uint32) (MessageSummary, error) {
@@ -433,7 +450,7 @@ func (c *realClient) ListMessageMetadata(ctx context.Context, mailbox string) ([
 		return nil, err
 	}
 	const chunkSize = 500
-	result := make([]MessageMetadata, 0, len(uids))
+	sizes := make(map[uint32]int64, len(uids))
 	for start := 0; start < len(uids); start += chunkSize {
 		end := min(start+chunkSize, len(uids))
 		setUIDs := make([]imap.UID, end-start)
@@ -448,22 +465,26 @@ func (c *realClient) ListMessageMetadata(ctx context.Context, mailbox string) ([
 				case imapclient.FetchItemDataUID:
 					meta.UID = uint32(value.UID)
 				case imapclient.FetchItemDataRFC822Size:
-					meta.Size = value.Size
-					meta.SizeKnown = true
+					if value.Size > 0 {
+						meta.Size = value.Size
+						meta.SizeKnown = true
+					}
 				}
 			}
-			if meta.UID == 0 || !meta.SizeKnown {
-				_ = cmd.Close()
-				return nil, fmt.Errorf("mailbox %q returned incomplete metadata", mailbox)
+			if meta.UID != 0 && meta.SizeKnown {
+				sizes[meta.UID] = meta.Size
 			}
-			result = append(result, meta)
 		}
-		if err := cmd.Close(); err != nil {
+		if err := cmd.Close(); err != nil && !isCommandRejected(err) {
 			return nil, fmt.Errorf("inventory metadata for %q: %w", mailbox, err)
 		}
 	}
-	if len(result) != len(uids) {
-		return nil, fmt.Errorf("mailbox %q returned metadata for %d of %d messages", mailbox, len(result), len(uids))
+	// Some servers silently omit FETCH data when RFC822.SIZE is unavailable.
+	// Retain the SEARCH inventory and let callers read those messages directly.
+	result := make([]MessageMetadata, 0, len(uids))
+	for _, uid := range uids {
+		size, known := sizes[uid]
+		result = append(result, MessageMetadata{UID: uid, Size: size, SizeKnown: known})
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].UID < result[j].UID })
 	return result, nil
@@ -593,14 +614,25 @@ func (c *realClient) SearchUIDs(ctx context.Context, after uint32) ([]uint32, er
 }
 
 func (c *realClient) FetchMetadata(ctx context.Context, uid uint32) (MessageMetadata, error) {
+	meta, err := c.fetchMetadata(ctx, uid, true)
+	if isCommandRejected(err) {
+		return c.fetchMetadata(ctx, uid, false)
+	}
+	return meta, err
+}
+
+func (c *realClient) fetchMetadata(ctx context.Context, uid uint32, includeSize bool) (MessageMetadata, error) {
 	if err := ctx.Err(); err != nil {
 		return MessageMetadata{}, err
 	}
 	section := &imap.FetchItemBodySection{Specifier: imap.PartSpecifierHeader, HeaderFields: []string{"Message-ID"}, Peek: true}
-	cmd := c.client.Fetch(imap.UIDSetNum(imap.UID(uid)), &imap.FetchOptions{UID: true, Flags: true, InternalDate: true, RFC822Size: true, BodySection: []*imap.FetchItemBodySection{section}})
+	cmd := c.client.Fetch(imap.UIDSetNum(imap.UID(uid)), &imap.FetchOptions{UID: true, Flags: true, InternalDate: true, RFC822Size: includeSize, BodySection: []*imap.FetchItemBodySection{section}})
 	defer cmd.Close()
 	msg := cmd.Next()
 	if msg == nil {
+		if err := cmd.Close(); err != nil {
+			return MessageMetadata{}, fmt.Errorf("fetch metadata for UID %d: %w", uid, err)
+		}
 		return MessageMetadata{}, errors.New("message metadata not returned")
 	}
 	meta := MessageMetadata{UID: uid}
@@ -617,8 +649,10 @@ func (c *realClient) FetchMetadata(ctx context.Context, uid uint32) (MessageMeta
 		case imapclient.FetchItemDataInternalDate:
 			meta.InternalDate = v.Time
 		case imapclient.FetchItemDataRFC822Size:
-			meta.Size = v.Size
-			meta.SizeKnown = true
+			if v.Size >= 0 {
+				meta.Size = v.Size
+				meta.SizeKnown = true
+			}
 		case imapclient.FetchItemDataBodySection:
 			if v.Literal != nil {
 				meta.MessageID, _ = readMessageID(v.Literal)
@@ -627,9 +661,6 @@ func (c *realClient) FetchMetadata(ctx context.Context, uid uint32) (MessageMeta
 	}
 	if err := cmd.Close(); err != nil {
 		return MessageMetadata{}, fmt.Errorf("fetch metadata for UID %d: %w", uid, err)
-	}
-	if meta.Size < 0 {
-		return MessageMetadata{}, errors.New("server returned invalid message size")
 	}
 	return meta, nil
 }

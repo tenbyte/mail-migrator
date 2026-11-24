@@ -31,7 +31,7 @@ CalDAV and CardDAV appear only after a session-only opt-in under Advanced settin
 
 Version 0.7.1 supports macOS 13 or later and Windows 10 or later. The project uses Go 1.27, Node.js 22, React, and Wails 2.15.
 
-Connection checks wait for the IMAP server greeting before login and apply the connection timeout to the complete connection setup. Checks and preflight use server-reported folder statistics without scanning individual messages. Missing size statistics appear as **Not pre-scanned**; unavailable folders are shown with a warning and skipped while other folders remain available for migration.
+Connection checks wait for the IMAP server greeting before login and apply the connection timeout to the complete connection setup. Checks and preflight use server-reported folder statistics without scanning individual messages. Missing counts and sizes appear as **Not pre-scanned**. Missing statistics or quota information do not prevent a migration from starting. If a server refuses to open a selected folder during transfer, the app reports the folder error and continues with the other folders.
 
 Mailbox notices are disabled by default. Configure them on the separate **Mailbox notices** page linked from Advanced settings. Every new migration stores an immutable copy of the current settings. After the migration completes, **Finalize mailbox notices** appends the enabled English plaintext/HTML messages; retrying is idempotent and a later delta sync excludes the generated source notice.
 

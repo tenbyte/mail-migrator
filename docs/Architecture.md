@@ -28,7 +28,7 @@ Source accounts are read-only during migration and delta sync. A manual delta sy
 
 The connection timeout covers DNS/TCP, TLS or STARTTLS, the server greeting, LOGIN, capabilities, and optional IMAP4rev2 negotiation. LOGIN is sent only after the greeting has been read. Expiry or cancellation closes the setup socket to interrupt protocol waits; after successful setup, this temporary cancellation hook is removed and the normal stall timeout applies.
 
-Connection checks and preflight read folder statistics with LIST-STATUS or STATUS. They do not inventory individual messages or tags to calculate missing folder sizes. Unknown sizes remain explicitly unknown in the interface. A legacy server rejection of EXAMINE can fall back to SELECT, while source operations continue to use non-mutating commands and PEEK body reads. A folder rejected by both status/open attempts is marked unavailable and skipped without excluding other folders.
+Connection checks and preflight discover folders with LIST, then read optional counts, sizes, and quota information within a separate time budget. The interface marks missing statistics as unknown. Transfer preparation only needs the destination folder list. During transfer, a legacy server rejection of EXAMINE can fall back to SELECT, while source operations continue to use non-mutating commands and PEEK body reads. The app reports failures to open selected folders as transfer errors and continues with the remaining folders.
 
 ## Mailbox notices
 

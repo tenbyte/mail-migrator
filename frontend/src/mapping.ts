@@ -130,7 +130,7 @@ export function dryRunCards(preflight: JobPreflightResult, mailMappings: FolderM
       title: 'Mail',
       metrics: [
         { value: selected.length, label: 'folders selected' },
-        { value: selected.reduce((sum, mapping) => sum + mapping.source.messages, 0), label: 'messages' },
+        { value: selected.reduce((sum, mapping) => sum + mapping.source.messages, 0), label: 'messages', unknown: selected.some(mapping => mapping.source.messagesUnknown) },
         { value: selected.reduce((sum, mapping) => sum + mapping.source.size, 0), label: 'Datenmenge', bytes: true, unknown: sizeUnknown },
         { value: selected.reduce((sum, mapping) => sum + mapping.source.size, 0), label: 'additional full verification', bytes: true, unknown: sizeUnknown },
         { value: selected.filter(mapping => mapping.destinationExists).length, label: 'bestehende Ziele' },
