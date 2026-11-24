@@ -1,20 +1,15 @@
 # Changelog
 
-## Unreleased
+## 0.7.1 - 2026-11-24
 
 ### Fixed
 
 - Mail migrations can start when an IMAP server fails to report folder statistics or quota. The review screen shows which statistics are unknown and keeps the folders available for transfer.
 - Message transfers use the raw body when the server omits or reports zero for the message size. Duplicate protection and verification can also use the raw body when size metadata is unavailable.
-
-## 0.7.1 - 2026-10-04
-
-### Fixed
-
 - IMAP connections now wait for the server greeting before sending LOGIN, avoiding intermittent login stalls when checking an account.
 - The connection timeout now covers the complete setup, including TLS/STARTTLS, the greeting, login, capabilities, and IMAP4rev2 negotiation. Successful connections retain their normal transfer stall timeout.
 - Login timeouts and cancellations are reported separately from explicit authentication rejections.
-- Folder inspection handles legacy servers that reject EXAMINE by retrying SELECT. Individually unavailable folders are skipped with a warning without blocking the remaining folders.
+- Folder access on legacy servers can retry SELECT after an EXAMINE rejection. Transfer errors for inaccessible folders are reported while the remaining folders continue.
 
 ### Changed
 
@@ -24,7 +19,8 @@
 
 ### Security
 
-- Updated the transitive frontend development dependency `brace-expansion` from 5.0.9 to 5.0.12 to resolve denial-of-service advisories.
+- Updated the transitive frontend development dependency `brace-expansion` to 5.1.0 to resolve denial-of-service advisories.
+- Updated the Go toolchain to 1.27.4 and patched the frontend development dependencies flagged by the security checks.
 
 ## 0.7.0 - 2026-09-10
 

@@ -4,8 +4,8 @@
 
 ## Requirements
 
-- Go 1.27
-- Node.js 22
+- Go 1.27.4
+- Node.js 22 (22.13 or later)
 - npm with lockfile support
 - Wails 2.15 build prerequisites for the target platform
 - Xcode Command Line Tools for macOS builds
@@ -30,7 +30,7 @@ make build-windows
 
 ```powershell
 $env:TENBYTE_LOG_LEVEL = "debug"
-$env:GOTOOLCHAIN = "go1.27.0"
+$env:GOTOOLCHAIN = "go1.27.4"
 go run github.com/wailsapp/wails/v2/cmd/wails@v2.15.0 dev -devserver localhost:34116 -loglevel Debug -v 2 -nocolour
 ```
 

@@ -29,7 +29,7 @@ CalDAV and CardDAV appear only after a session-only opt-in under Advanced settin
 - Exports migration reports and privacy-conscious support bundles on demand.
 - Provides separate migration-data and full factory resets under Advanced settings.
 
-Version 0.7.1 supports macOS 13 or later and Windows 10 or later. The project uses Go 1.27, Node.js 22, React, and Wails 2.15.
+Version 0.7.1 supports macOS 13 or later and Windows 10 or later. The project uses Go 1.27.4, Node.js 22, React, and Wails 2.15.
 
 Connection checks wait for the IMAP server greeting before login and apply the connection timeout to the complete connection setup. Checks and preflight use server-reported folder statistics without scanning individual messages. Missing counts and sizes appear as **Not pre-scanned**. Missing statistics or quota information do not prevent a migration from starting. If a server refuses to open a selected folder during transfer, the app reports the folder error and continues with the other folders.
 
@@ -43,7 +43,7 @@ The software is provided without warranties. Use it at your own risk. The [Apach
 
 ## Build and development
 
-Install Go 1.27 and Node.js 22. macOS builds require Xcode Command Line Tools. Windows builds require WebView2 and a supported C/C++ toolchain.
+Install Go 1.27.4 and Node.js 22 (22.13 or later). macOS builds require Xcode Command Line Tools. Windows builds require WebView2 and a supported C/C++ toolchain.
 
 ```bash
 make frontend

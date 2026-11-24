@@ -1,6 +1,6 @@
 module github.com/tenbyte/mail-migrator
 
-go 1.27.0
+go 1.27.4
 
 require (
 	github.com/emersion/go-ical v0.0.0-20250609112844-439c63cef608
