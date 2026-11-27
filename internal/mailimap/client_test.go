@@ -202,6 +202,73 @@ type imapStep struct {
 	reply   string
 }
 
+func TestSearchUIDsUsesClassicSearchAndFiltersCheckpoint(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		after uint32
+		steps []imapStep
+		want  []uint32
+	}{
+		{"full inventory", 0, []imapStep{{` UID SEARCH ALL\r\n$`, "* SEARCH 1 3 9\r\n%s OK search complete\r\n"}}, []uint32{1, 3, 9}},
+		{"delta inventory", 3, []imapStep{{` UID SEARCH UID 4:\*\r\n$`, "* SEARCH 9\r\n%s OK search complete\r\n"}}, []uint32{9}},
+		{"reversed wildcard range", 9, []imapStep{{` UID SEARCH UID 10:\*\r\n$`, "* SEARCH 9\r\n%s OK search complete\r\n"}}, []uint32{}},
+		{"range fallback", 3, []imapStep{
+			{` UID SEARCH UID 4:\*\r\n$`, "%s BAD Invalid or unsupported SEARCH criteria.\r\n"},
+			{` UID SEARCH ALL\r\n$`, "* SEARCH 1 3 9\r\n%s OK search complete\r\n"},
+		}, []uint32{9}},
+		{"empty mailbox", 0, []imapStep{{` UID SEARCH ALL\r\n$`, "* SEARCH\r\n%s OK search complete\r\n"}}, []uint32{}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := scriptedClient(t, imap.CapSet{imap.CapIMAP4rev1: {}}, test.steps)
+			uids, err := client.SearchUIDs(context.Background(), test.after)
+			if err != nil || !reflect.DeepEqual(uids, test.want) {
+				t.Fatalf("UID inventory = %v, %v, want %v", uids, err, test.want)
+			}
+		})
+	}
+}
+
+func TestSearchUIDsPreservesRejectedSearchError(t *testing.T) {
+	client := scriptedClient(t, imap.CapSet{imap.CapIMAP4rev1: {}}, []imapStep{
+		{` UID SEARCH ALL\r\n$`, "%s BAD Invalid or unsupported SEARCH criteria.\r\n"},
+	})
+	if _, err := client.SearchUIDs(context.Background(), 0); err == nil || !strings.Contains(err.Error(), "search source UIDs") {
+		t.Fatalf("rejected search was not reported: %v", err)
+	}
+}
+
+func TestSearchUIDsRejectsEmptyInventoryForNonemptyMailbox(t *testing.T) {
+	client := scriptedClient(t, imap.CapSet{imap.CapIMAP4rev1: {}}, []imapStep{
+		{` UID SEARCH ALL\r\n$`, "* SEARCH\r\n%s OK search complete\r\n"},
+	})
+	client.selectedSize = 2
+	if _, err := client.SearchUIDs(context.Background(), 0); err == nil {
+		t.Fatal("an incomplete inventory was accepted as an empty mailbox")
+	}
+}
+
+func TestMessageIDLookupsUseClassicSearch(t *testing.T) {
+	for _, candidate := range []bool{false, true} {
+		t.Run(fmt.Sprintf("candidate=%v", candidate), func(t *testing.T) {
+			client := scriptedClient(t, imap.CapSet{imap.CapIMAP4rev1: {}}, []imapStep{
+				{` EXAMINE INBOX\r\n$`, "* FLAGS ()\r\n* 0 EXISTS\r\n* OK [UIDVALIDITY 42] valid\r\n%s OK [READ-ONLY] selected\r\n"},
+				{` UID SEARCH HEADER "Message-ID" "<test@example.test>"\r\n$`, "* SEARCH\r\n%s OK search complete\r\n"},
+			})
+			if candidate {
+				value, err := client.FindCandidate(context.Background(), "INBOX", MessageMetadata{MessageID: "<test@example.test>"})
+				if err != nil || value.Found {
+					t.Fatalf("candidate lookup = %#v, %v", value, err)
+				}
+			} else {
+				validity, uid, err := client.FindMessageByID(context.Background(), "INBOX", "<test@example.test>")
+				if err != nil || uid != 0 || validity != 42 {
+					t.Fatalf("notice lookup = %d, %d, %v", validity, uid, err)
+				}
+			}
+		})
+	}
+}
+
 func scriptedClient(t *testing.T, caps imap.CapSet, steps []imapStep) *realClient {
 	t.Helper()
 	clientConn, serverConn := net.Pipe()

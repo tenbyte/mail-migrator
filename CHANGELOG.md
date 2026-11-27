@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.2 - 2026-11-27
+
+### Fixed
+
+- UID inventories and Message-ID lookups use classic IMAP SEARCH commands compatible with servers that do not support ESEARCH. Delta inventories can fall back to a full UID search and filter the checkpoint locally when a server rejects UID ranges.
+- Failed folder inventories preserve their actual progress counters. Runs completed with errors show the processed portion instead of automatically displaying 100 percent.
+
 ## 0.7.1 - 2026-11-24
 
 ### Fixed

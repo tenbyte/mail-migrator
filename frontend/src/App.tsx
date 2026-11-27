@@ -196,7 +196,12 @@ function Toggle({ checked, label, onChange }: { checked: boolean; label: string;
 
 export function displayedProgress(progress: Pick<Progress, 'state' | 'runMode' | 'runItemsTotal' | 'runItemsDone' | 'runIndeterminate' | 'messagesTotal' | 'messagesCopied'>) {
   const terminal = ['COMPLETED', 'COMPLETED_WITH_ERRORS'].includes(progress.state)
-  if (terminal) return { percent: 100, done: progress.runItemsDone ?? progress.messagesCopied, total: progress.runItemsTotal ?? progress.messagesTotal, indeterminate: false, runBased: progress.runMode === 'reconcile' || progress.runItemsTotal !== undefined }
+  if (terminal) {
+    const done = progress.runItemsDone ?? progress.messagesCopied
+    const total = progress.runItemsTotal ?? progress.messagesTotal
+    const percent = progress.state === 'COMPLETED' ? 100 : total ? Math.min(100, done / total * 100) : 0
+    return { percent, done, total, indeterminate: false, runBased: progress.runMode === 'reconcile' || progress.runItemsTotal !== undefined }
+  }
   if (progress.runMode === 'reconcile' || progress.runItemsTotal !== undefined) {
     const total = progress.runItemsTotal ?? 0; const done = progress.runItemsDone ?? 0
     return { percent: total ? Math.min(99.9, done / total * 100) : 0, done, total, indeterminate: Boolean(progress.runIndeterminate), runBased: true }

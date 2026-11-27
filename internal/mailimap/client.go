@@ -592,20 +592,31 @@ func (c *realClient) SearchUIDs(ctx context.Context, after uint32) ([]uint32, er
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	set := imap.UIDSet{}
-	start := imap.UID(after + 1)
-	if start == 0 {
-		start = 1
+	if after == ^uint32(0) {
+		return []uint32{}, nil
 	}
-	set.AddRange(start, 0)
-	data, err := c.client.UIDSearch(&imap.SearchCriteria{UID: []imap.UIDSet{set}}, &imap.SearchOptions{ReturnAll: true}).Wait()
+	criteria := &imap.SearchCriteria{}
+	if after > 0 {
+		set := imap.UIDSet{}
+		set.AddRange(imap.UID(after+1), 0)
+		criteria.UID = []imap.UIDSet{set}
+	}
+	// Classic UID SEARCH returns every matching UID without requiring ESEARCH.
+	data, err := c.client.UIDSearch(criteria, nil).Wait()
+	if after > 0 && isCommandRejected(err) && ctx.Err() == nil {
+		// A complete search also works with servers that reject UID ranges.
+		data, err = c.client.UIDSearch(&imap.SearchCriteria{}, nil).Wait()
+	}
 	if err != nil {
 		return nil, fmt.Errorf("search source UIDs: %w", err)
 	}
 	raw := data.AllUIDs()
-	out := make([]uint32, len(raw))
-	for i, u := range raw {
-		out[i] = uint32(u)
+	out := make([]uint32, 0, len(raw))
+	for _, u := range raw {
+		// IMAP ranges ending in * may include the last UID below the boundary.
+		if uint32(u) > after {
+			out = append(out, uint32(u))
+		}
 	}
 	if after == 0 && c.selectedSize > 0 && len(out) == 0 {
 		return nil, fmt.Errorf("mailbox %q reports %d messages but a complete UID SEARCH returned none", c.selectedName, c.selectedSize)
@@ -765,7 +776,7 @@ func (c *realClient) FindCandidate(ctx context.Context, mailbox string, meta Mes
 		return Candidate{}, err
 	}
 	criteria := &imap.SearchCriteria{Header: []imap.SearchCriteriaHeaderField{{Key: "Message-ID", Value: meta.MessageID}}}
-	data, err := c.client.UIDSearch(criteria, &imap.SearchOptions{ReturnAll: true}).Wait()
+	data, err := c.client.UIDSearch(criteria, nil).Wait()
 	if err != nil {
 		return Candidate{}, err
 	}
@@ -794,7 +805,7 @@ func (c *realClient) FindMessageByID(ctx context.Context, mailbox, messageID str
 		return 0, 0, err
 	}
 	criteria := &imap.SearchCriteria{Header: []imap.SearchCriteriaHeaderField{{Key: "Message-ID", Value: messageID}}}
-	data, err := c.client.UIDSearch(criteria, &imap.SearchOptions{ReturnAll: true}).Wait()
+	data, err := c.client.UIDSearch(criteria, nil).Wait()
 	if err != nil {
 		return 0, 0, fmt.Errorf("find mailbox notice: %w", err)
 	}

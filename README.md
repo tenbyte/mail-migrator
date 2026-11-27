@@ -29,7 +29,7 @@ CalDAV and CardDAV appear only after a session-only opt-in under Advanced settin
 - Exports migration reports and privacy-conscious support bundles on demand.
 - Provides separate migration-data and full factory resets under Advanced settings.
 
-Version 0.7.1 supports macOS 13 or later and Windows 10 or later. The project uses Go 1.27.4, Node.js 22, React, and Wails 2.15.
+Version 0.7.2 supports macOS 13 or later and Windows 10 or later. The project uses Go 1.27.4, Node.js 22, React, and Wails 2.15.
 
 Connection checks wait for the IMAP server greeting before login and apply the connection timeout to the complete connection setup. Checks and preflight use server-reported folder statistics without scanning individual messages. Missing counts and sizes appear as **Not pre-scanned**. Missing statistics or quota information do not prevent a migration from starting. If a server refuses to open a selected folder during transfer, the app reports the folder error and continues with the other folders.
 
@@ -59,7 +59,7 @@ make build-windows
 
 `make dev` starts the Wails development environment; `make dev-debug` adds detailed privacy-conscious diagnostics for reproducing failures. Desktop binaries are written to `build/bin`. CycloneDX SBOM files are generated under `build/compliance` and are not committed.
 
-Pushing a matching version tag such as `v0.7.1` runs the release workflow. It builds a Windows executable and a universal macOS app, packages them with SHA-256 checksums, and publishes the files on the corresponding GitHub release. Generated binaries and release packages remain ignored by Git.
+Pushing a matching version tag such as `v0.7.2` runs the release workflow. It builds a Windows executable and a universal macOS app, packages them with SHA-256 checksums, and publishes the files on the corresponding GitHub release. Generated binaries and release packages remain ignored by Git.
 
 ## Security and local data
 

@@ -3,6 +3,13 @@ import { buildDAVServiceRequest, buildSourceDeletionActions, disabledDAVServices
 import type { FolderMapping, SourceDeletion } from './types'
 
 describe('displayedProgress', () => {
+  it('preserves actual progress when a folder fails before any messages are processed', () => {
+    expect(displayedProgress({ state: 'COMPLETED_WITH_ERRORS', runMode: 'migration', runItemsTotal: 100, runItemsDone: 0, messagesTotal: 100, messagesCopied: 0 }))
+      .toEqual({ percent: 0, done: 0, total: 100, indeterminate: false, runBased: true })
+    expect(displayedProgress({ state: 'COMPLETED_WITH_ERRORS', runMode: 'migration', runItemsTotal: 100, runItemsDone: 25, messagesTotal: 100, messagesCopied: 25 }).percent).toBe(25)
+    expect(displayedProgress({ state: 'COMPLETED_WITH_ERRORS', messagesTotal: 0, messagesCopied: 0 }).percent).toBe(0)
+  })
+
   it('ignores historical totals during an indeterminate delta inventory', () => {
     expect(displayedProgress({
       state: 'RUNNING', runMode: 'reconcile', runItemsTotal: 0, runItemsDone: 0, runIndeterminate: true,

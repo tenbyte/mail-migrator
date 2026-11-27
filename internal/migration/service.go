@@ -449,7 +449,9 @@ dispatch:
 		state = domain.MigrationCompletedWithErrors
 	}
 	message := lastFailure.get()
-	runItemsDone.Store(runItemsTotal.Load())
+	if state == domain.MigrationCompleted {
+		runItemsDone.Store(runItemsTotal.Load())
+	}
 	if request.Mode != "reconcile" {
 		// The actual transfer can exceed the estimates when statistics are incomplete.
 		_ = s.db.UpdateServiceCurrent(ctx, id, domain.ServiceMail, "", max(runItemsTotal.Load(), copiedMessages.Load()), max(totalBytes, copiedBytes.Load()))
